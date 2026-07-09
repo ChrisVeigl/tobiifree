@@ -46,6 +46,7 @@ import struct
 import sys
 import threading
 import time
+import argparse
 from pathlib import Path
 
 try:
@@ -109,6 +110,16 @@ def recv_exact(sock, n):
             raise EOFError("Disconnected from daemon")
         buf.extend(chunk)
     return bytes(buf)
+
+
+def send_only(self, cmd_type, payload=b''):
+    """Fire-and-forget send, no response wait (for commands like SUBSCRIBE
+    that don't produce an SRV_RESPONSE — success is observed via SRV_GAZE frames)."""
+    with self._lock:
+        if self._disconnected_exc is not None:
+            raise EOFError(f"Disconnected from daemon: {self._disconnected_exc}")
+        header = encode_header(cmd_type, len(payload))
+        self.sock.sendall(header + payload)
 
 
 class SharedGaze:
@@ -360,8 +371,21 @@ def run_live_view(conn, screen, font):
 
         time.sleep(0.01)
 
-
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tobii calibration with live feedback.")
+    parser.add_argument(
+        "-b", "--blob",
+        type=Path,
+        default=None,
+        help="Path to a previously saved calibration blob to apply at startup, "
+             "skipping the initial 5-point calibration.",
+    )
+    return parser.parse_args()
+    
+    
 def main():
+    args = parse_args()
+    
     sock_path = get_socket_path()
     print(f"Connecting to tobiifreed at {sock_path}...")
 
@@ -378,10 +402,25 @@ def main():
 
     print("Connected to daemon socket.")
 
-    conn = DaemonConnection(sock)
+    try:
+        conn = DaemonConnection(sock)
 
-    # Subscribe so gaze frames start flowing (used by the live view later).
-    conn.request(CMD_SUBSCRIBE)
+        # Subscribe so gaze frames start flowing (used by the live view later).
+        conn.send_only(CMD_SUBSCRIBE)
+
+        # Wait briefly for the first gaze frame as confirmation instead of an ack.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            _, _, valid_seen = conn.gaze.get()
+            if conn.gaze.get() != (0.5, 0.5, False):  # any update at all, valid or not
+                break
+            time.sleep(0.05)
+        else:
+            print("Warning: no gaze data received yet after subscribing; continuing anyway.")
+
+    except (TimeoutError, RuntimeError, EOFError, OSError) as e:
+        print(f"Warning: failed to subscribe to gaze stream: {e}")
+        print("Continuing without live gaze feedback where possible.")
 
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -391,11 +430,25 @@ def main():
     big_font = pygame.font.Font(None, 48)
 
     try:
-        # Run an initial calibration. If the user cancels immediately, just quit.
-        blob = run_calibration(conn, screen, font, big_font)
+        blob = None
+        if args.blob is not None:
+            if args.blob.exists():
+                try:
+                    blob = args.blob.read_bytes()
+                    conn.request(CMD_CAL_APPLY, blob)
+                    print(f"Applied calibration blob from {args.blob}")
+                except (RuntimeError, TimeoutError, OSError) as e:
+                    print(f"Failed to apply blob '{args.blob}': {e}")
+                    blob = None
+            else:
+                print(f"Blob file not found: {args.blob}")
+
         if blob is None:
-            print("Calibration cancelled.")
-            return
+            # No blob given, or applying it failed — fall back to calibrating.
+            blob = run_calibration(conn, screen, font, big_font)
+            if blob is None:
+                print("Calibration cancelled.")
+                return
 
         while True:
             CALIB_BLOB_PATH.write_bytes(blob)
