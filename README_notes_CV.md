@@ -26,33 +26,12 @@ using some unintuitive values for cy an cx (as the tracker is centered on the lo
 }
 ```
 
-Question is if we could provide a calibration method that is accessible for people who cannot edit files or deal with complex settings / small UI elements!
-Is the calibration workbench in this fork useful (and shall it be merged)? https://github.com/george-wyy/tobiifree
+Question is why the exact screen dimension in mm is needed (given that this does not have to be specified in the Tobii Windows driver/SDK)
+ - and if we could provide a calibration method that is accessible for people who cannot edit files or deal with complex settings / small UI elements ...
 
+The calibration workbench the fork by georgy-wyy (https://github.com/george-wyy/tobiifree) provides an additional layer for gaze data correction 
+(client-side, using affine or poly transformation on top of the on-device calibration) - this is an interesting approach, but still we need to make on-device-calibration made easier / accessible (see below).
 
-## tobiifree-overlay screen mapping issue
-In my first try I got completely wrong mappings for the gaze point overlay.
-I noted following warning messages when running "just overlay":
-
-```
-it appears your Wayland compositor does not support the Session Lock protocol
-** (tobiifree-overlay:15852): WARNING **: 21:08:00.664: Failed to initialize layer surface, it appears your Wayland compositor doesn't support Layer Shell
-```
-
-It seems that the gtk4-layer-shell Wayland extension fails to initialize on my desktop (I am using Ubuntu with Gnome/Mutter).
-
-I added log messages to main.zig and found that the gaze x/y coordinates looked good (normalized to 0..1 for the x/y gaze location when looking around at the screen),
-but the mapped screen coordinates where completely wrong, e.g:
-
-```
-Info(overlay): gaze norm: x=0.200 y=0.358 | screen px: x=307 y=344 | screen=1536x960 (sample #709)
-```
-
-I noticed that the screen size was detected as 1536 x 960 - which is wrong, as I used a resolution of 1920 x 1200 (with a 1.25 scale factor).
-The error was bigger than just the scale factor.. It turned out that because the GTK Layer Shell failed, the overlay window silently falls back to a standard floating window with a much smaller size! 
-
-Following a suggestion by Gemini 3.1, I forced the fallback standard window into Fullscreen (and later into an undocked, floating window with fullscreen size because GTK refused to render fullscreen windows with transparent background).
-Thus, I got a working gazepoint overlay which matches my actual gaze position quite well!
 
 ## Calibration procedure(s)
 
@@ -60,15 +39,46 @@ I am still unsure how to calibrate the system correctly (e.g. to a new user).
 I noticed the different calibration variants in the web demo, but I am not sure in which way they differ and how to use them correcty
 (the goal would be to avoid manual tweaking of the tobii.json config file, and just trigger the calibration procedure for a (new) user, same as with the original Tobii driver.)
 
-* how to use the sliders in order to adjust the setup correctly? 
+* the sliders are helpful for screen size / orientation adjustments - but I do not understand in which way this could generate a tobii.json file with display area settings that are actually useful for local application (so that tobiifreed uses these settings)? 
 * do the slider settings actually make a difference for the calibration parameters which are stored to the tobii tracker - or are these just relevant for the web GUI display?
-* is it sufficient to run the (5- or 9-point) on-device-calibration? are these settings then automatically applied
-* (how) can a tobii.json be generated / downloaded which could then be applied by tobiifreed ? 
-* is there a way to run a calibration procedure without the Web GUI (e.g. via tobiifreed / socket)  
+* is it sufficient to run the (5- or 9-point) on-device-calibration to get persistent calibration on the device? It seems that cal_apply is not called after the calibration is finished when used from the web demo .. and there is no button for cal_apply ..
+* I made a python calibration script which follows the procedure outlined in the SDK - it connects to tobiifreed, which logs the following messages during the calibration process:
+
+```
+info(server): client connected (total: 1)
+debug(tracker): cal_start step 0: send 34 bytes
+debug(tracker): cal_start step 1: send 44 bytes
+info(tracker): cal_start complete in 2 steps
+debug(tobiifreed): forwarded cmd=0x21 request_id=7 for fd=11
+debug(tobiifreed): routed response for cmd=0x21 to fd=11
+debug(tobiifreed): forwarded cmd=0x21 request_id=8 for fd=11
+debug(tobiifreed): routed response for cmd=0x21 to fd=11
+debug(tobiifreed): forwarded cmd=0x21 request_id=9 for fd=11
+debug(tobiifreed): routed response for cmd=0x21 to fd=11
+debug(tobiifreed): forwarded cmd=0x21 request_id=10 for fd=11
+debug(tobiifreed): routed response for cmd=0x21 to fd=11
+debug(tobiifreed): forwarded cmd=0x21 request_id=11 for fd=11
+debug(tobiifreed): routed response for cmd=0x21 to fd=11
+debug(tracker): cal_finish step 0: send 34 bytes
+debug(tracker): cal_finish step 1: send 34 bytes
+debug(tracker): cal_finish step 2: send 43 bytes
+info(tracker): cal_finish complete in 3 steps
+debug(tracker): cal_apply step 0: send 34 bytes
+debug(tracker): cal_apply step 1: send 44 bytes
+debug(tracker): cal_apply step 2: send 1514 bytes
+debug(tracker): cal_apply step 3: send 43 bytes
+info(tracker): cal_apply complete in 4 steps
+debug(tobiifreed): gaze #500: vL=0 vR=4 x=1.048 y=-0.127
+info(server): client disconnected (total: 0)
+```
+
+Although this looks correct (cal_apply is sent after cal_finish, including the obtained calibration blob) there is no visible effect of the calibration after it was done (same gaze coordinates, even if i look at wrong locations during calibration ...)
+ 
 
 ## Mouse emulation
 
 I added a mouse emulation client (tobiifree-mouse) which sets the mouse cursor to the current gaze location and provides optional dwell clicking.
+It also features client-side calibration and gaze position correction, using a built in calibration GUI and offset correction points which can be added on-demand.
 
 
 ```
@@ -80,7 +90,6 @@ Options:
   --click-dwell-ms <int>  Time in ms gaze must remain in radius to click (default: 1000)
 ```
 
-
 Because of the restrictions Wayland imposes to system-wide mouse cursor control, uinput was used, which needs its own udev rule:
 
 ```
@@ -91,10 +100,12 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-The mouse activities can be paused/unpaused using a system-wide hotkey (defined in the Linux Desktop keyboard settings) which sends the singal SIGUSR1 to the running task, using:
+
+The mouse activities can be paused/unpaused using a system-wide hotkey (defined in the Linux Desktop keyboard settings) which sends the signal SIGUSR1 to the running task, using:
+The calibration GUI can be shown/hidden by sending SIGUSR2, e.g.:
 
 ```
-pkill -SIGUSR1 tobiifree-mouse 
+pkill -SIGUSR1 gaze_mouse 
 ```
 
 
@@ -118,16 +129,68 @@ found 2 CAI container(s)
   [1] off=0x12b3c28 size=45665 version=t2srv:02a1a6a977 -> fw_extracted//cai_1_t2srv_02a1a6a977.bin
 ```
 
-Still, i am unsure if i want to try out the flash tool, as i don't want to brick the only ET-5 I have here ;)
+Still, i am unsure if this is correct and the flash tool would work, as i don't want to brick the only ET-5 I have here ;)
 does this look correct? - and: how can a ET-5 in runtime mode be put into bootloader mode for accepting new firmware?
 
 
+## Building / Running on RaspberryPi
 
-## Other remarks
+For building on a raspberrpiPi change the following line in flake.nix:
+```
+    # system = "x86_64-linux";
+    system = "aarch64-linux";
+```
+
+and run ```npm install``` in the repository root folder to install vite for the web demo.
+
+
+
+In case of access problem to uinput (for mouse emulation):
+```
+ sudo chgrp uinput /dev/uinput
+```
+
+or if this does not help try this temporary workaround
+```
+ sudo chown pi /dev/uinput
+```
+
+
+
+## Other remarks and findings 
+
+
+### USB access problems in Chrome
 USB access for the Web demo did not work in Chrome (althouth udev rules were correctly installed), unless I enabled the web browser access rights via snap:
 (only relevant if the browser was installed via the snap package manager)
 
 ```
 sudo snap connect chromium:raw-usb
 ```
+ 
+### tobiifree-overlay screen mapping issue
+In my first try I got completely wrong mappings for the gaze point overlay.
+I noted following warning messages when running "just overlay":
+
+```
+it appears your Wayland compositor does not support the Session Lock protocol
+** (tobiifree-overlay:15852): WARNING **: 21:08:00.664: Failed to initialize layer surface, it appears your Wayland compositor doesn't support Layer Shell
+```
+
+It seems that the gtk4-layer-shell Wayland extension fails to initialize on my desktop (I am using Ubuntu with Gnome/Mutter).
+
+I added log messages to main.zig and found that the gaze x/y coordinates looked good (normalized to 0..1 for the x/y gaze location when looking around at the screen),
+but the mapped screen coordinates where completely wrong, e.g:
+
+```
+Info(overlay): gaze norm: x=0.200 y=0.358 | screen px: x=307 y=344 | screen=1536x960 (sample #709)
+```
+
+I noticed that the screen size was detected as 1536 x 960 - which is wrong, as I used a resolution of 1920 x 1200 (with a 1.25 scale factor).
+The error was bigger than just the scale factor.. It turned out that because the GTK Layer Shell failed, the overlay window silently falls back to a standard floating window with a much smaller size! 
+
+Following a suggestion by Gemini 3.1, I forced the fallback standard window into Fullscreen (and later into an undocked, floating window with fullscreen size because GTK refused to render fullscreen windows with transparent background).
+Thus, I got a working gazepoint overlay which matches my actual gaze position quite well!
+
+ 
  
