@@ -112,16 +112,6 @@ def recv_exact(sock, n):
     return bytes(buf)
 
 
-def send_only(self, cmd_type, payload=b''):
-    """Fire-and-forget send, no response wait (for commands like SUBSCRIBE
-    that don't produce an SRV_RESPONSE — success is observed via SRV_GAZE frames)."""
-    with self._lock:
-        if self._disconnected_exc is not None:
-            raise EOFError(f"Disconnected from daemon: {self._disconnected_exc}")
-        header = encode_header(cmd_type, len(payload))
-        self.sock.sendall(header + payload)
-
-
 class SharedGaze:
     """Thread-safe holder for the most recent gaze sample."""
 
@@ -211,6 +201,15 @@ class DaemonConnection:
             if self._pending_cmd is not None:
                 self._pending_error = f"Daemon Error for cmd 0x{self._pending_cmd:02x}"
                 self._pending_event.set()
+
+    def send_only(self, cmd_type, payload=b''):
+        """Fire-and-forget send, no response wait (for commands like SUBSCRIBE
+        that don't produce an SRV_RESPONSE — success is observed via SRV_GAZE frames)."""
+        with self._lock:
+            if self._disconnected_exc is not None:
+                raise EOFError(f"Disconnected from daemon: {self._disconnected_exc}")
+            header = encode_header(cmd_type, len(payload))
+            self.sock.sendall(header + payload)
 
     def request(self, cmd_type, payload=b'', timeout=30.0):
         with self._lock:
