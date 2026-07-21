@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
 gaze_mouse.py — drive the mouse cursor from tobiifreed's gaze stream,
-with an on-demand fullscreen calibration GUI.
+with an on-demand fullscreen calibration GUI and optional eye-origin
+head-movement correction.
 
 Connects to the tobiifreed unix socket, subscribes to gaze data, and maps
 the normalized (0..1) gaze coordinates to absolute screen coordinates
 using a virtual uinput device (absolute pointer).
 
-Two hotkeys (bind these in your Linux desktop environment):
+Three hotkeys (bind these in your Linux desktop environment):
 
     SIGUSR1 — pause/resume gaze -> mouse control
     SIGUSR2 — toggle the fullscreen calibration window
+    SIGUSR3 — toggle eye-origin head-movement correction
+              (NOTE: Linux has no real SIGUSR3. This is implemented using
+              the SIGRTMIN real-time signal instead — send that signal to
+              get the same effect; it's just referred to as "SIGUSR3"
+              throughout this file and its messages for convenience.)
 
 While the calibration window is open, mouse emulation is bypassed
 entirely (your real mouse/touchpad works normally) so you can click on
@@ -18,14 +24,26 @@ targets. A red dot follows your *raw*, uncorrected gaze so you can see
 the tracker's current error. Left-click anywhere to record a calibration
 point at that location (storing the offset between where you clicked and
 where the tracker thought you were looking); a green dot shows the corrected
-gaze position. Right-click removes the nearest calibration point. 
+gaze position. Right-click removes the nearest calibration point.
 Points are saved to calib_points.json immediately and reloaded automatically
 on the next run.
 
-    kill -USR1 <pid>      # pause/resume
-    kill -USR2 <pid>      # toggle calibration window
+Eye-origin head-movement correction (SIGUSR3 / SIGRTMIN) is a separate,
+optional layer on top of the calibration-point correction. While enabled,
+frame-to-frame changes in eye origin position (i.e. how much your head has
+moved since the last sample) are scaled by a gain factor and accumulated
+into an extra x/y offset added to the mapped mouse position. This can help
+compensate for gaze-mapping drift caused by head movement between/during
+calibration. Toggling it off and back on resets the accumulated offset and
+re-baselines against the eye origin at the moment it's re-enabled, so there
+is no jump discontinuity.
+
+    kill -USR1 <pid>          # pause/resume
+    kill -USR2 <pid>          # toggle calibration window
+    kill -SIGRTMIN <pid>      # toggle eye-origin head-movement correction ("SIGUSR3")
     pkill -USR1 -f gaze_mouse.py
     pkill -USR2 -f gaze_mouse.py
+    pkill -SIGRTMIN -f gaze_mouse.py
 
 Requires:
     pip install evdev pygame
@@ -47,6 +65,14 @@ math; the protocol/struct details are unchanged from before:
            payload.
   Socket path: $XDG_RUNTIME_DIR/tobiifreed/gaze.sock (falls back to /tmp
            if XDG_RUNTIME_DIR is unset).
+
+  NOTE on eye origins: the struct has 12 embedded 3D (x,y,z f64) blocks
+  after the 2D gaze fields, described in this file's original comments as
+  "eye origins, trackbox pos, 3D gaze, display-space variants". This
+  script assumes the FIRST two of those 12 blocks are the left/right eye
+  origin (in whatever coordinate system tobiifreed reports — typically a
+  user coordinate system in mm). If tobiifree_core.zig orders its fields
+  differently, adjust the `origin_L` / `origin_R` slice below.
 ------------------------------------------------------------------------
 """
 
@@ -170,6 +196,12 @@ class SharedGaze:
         self.raw_y = height / 2.0
         self.valid = False
 
+        # Decoded eye-origin debug info (see update_origin/get_origin below).
+        self.origin_L = (0.0, 0.0, 0.0)
+        self.origin_R = (0.0, 0.0, 0.0)
+        self.origin_vL = None
+        self.origin_vR = None
+
     def update(self, x: float, y: float, valid: bool) -> None:
         with self._lock:
             self.raw_x, self.raw_y, self.valid = x, y, valid
@@ -177,6 +209,15 @@ class SharedGaze:
     def get(self):
         with self._lock:
             return self.raw_x, self.raw_y, self.valid
+
+    def update_origin(self, origin_L, origin_R, vL: int, vR: int) -> None:
+        with self._lock:
+            self.origin_L, self.origin_R = origin_L, origin_R
+            self.origin_vL, self.origin_vR = vL, vR
+
+    def get_origin(self):
+        with self._lock:
+            return self.origin_L, self.origin_R, self.origin_vL, self.origin_vR
 
 
 # ── Main application ─────────────────────────────────────────────────────
@@ -192,6 +233,13 @@ class GazeMouseApp:
         self.calibration_mode = False
         self._displayed_calibration_mode = False  # what the pygame window currently shows
 
+        # Eye-origin head-movement correction state (toggled via SIGUSR3/SIGRTMIN).
+        self.head_correction_enabled = False
+        self.head_offset_x = 0.0
+        self.head_offset_y = 0.0
+        self._prev_origin_xy = None  # (x, y) of the eye origin last frame, for delta computation
+        self._last_eye_origin_print = 0.0  # monotonic timestamp, for throttling --print-eye-origin
+
         self.shared = SharedGaze(self.width, self.height)
         self.ui = make_uinput_device(self.width, self.height)
         self.smoothed_x = None
@@ -202,6 +250,10 @@ class GazeMouseApp:
 
         signal.signal(signal.SIGUSR1, self._toggle_pause)
         signal.signal(signal.SIGUSR2, self._toggle_calibration)
+        # True SIGUSR3 doesn't exist on Linux, so SIGRTMIN stands in for it.
+        # It's referred to as "SIGUSR3" in log messages for convenience.
+        self._head_correction_signal = signal.SIGRTMIN
+        signal.signal(self._head_correction_signal, self._toggle_head_correction)
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
 
@@ -214,6 +266,19 @@ class GazeMouseApp:
     def _toggle_calibration(self, signum, frame):
         self.calibration_mode = not self.calibration_mode
         print(f"[gaze_mouse] calibration window {'shown' if self.calibration_mode else 'hidden'}",
+              file=sys.stderr)
+
+    def _toggle_head_correction(self, signum, frame):
+        self.head_correction_enabled = not self.head_correction_enabled
+        # Reset the accumulated offset and the delta baseline every time this
+        # is toggled (on OR off) so re-enabling never produces a jump: the
+        # first frame after toggling just re-establishes the baseline eye
+        # origin rather than applying a stale/large delta.
+        self.head_offset_x = 0.0
+        self.head_offset_y = 0.0
+        self._prev_origin_xy = None
+        print(f"[gaze_mouse] eye-origin head-movement correction (SIGUSR3) "
+              f"{'enabled' if self.head_correction_enabled else 'disabled'} (offset reset)",
               file=sys.stderr)
 
     def _shutdown(self, signum, frame):
@@ -241,6 +306,26 @@ class GazeMouseApp:
             return vL == VALID and vR == VALID
         return vL == VALID or vR == VALID  # "either" (default)
 
+    # ---- eye-origin helpers ----
+
+    @staticmethod
+    def _pick_origin_xy(origin_L, origin_R, vL: int, vR: int):
+        """
+        Average the (x, y) components (z/depth ignored) of whichever eye
+        origin(s) are currently valid, for use as a 2D head-position proxy.
+        Returns None if neither eye is valid this frame.
+        """
+        samples = []
+        if vL == VALID:
+            samples.append((origin_L[0], origin_L[1]))
+        if vR == VALID:
+            samples.append((origin_R[0], origin_R[1]))
+        if not samples:
+            return None
+        ox = sum(s[0] for s in samples) / len(samples)
+        oy = sum(s[1] for s in samples) / len(samples)
+        return ox, oy
+
     # ---- background gaze-reading thread ----
 
     def handle_gaze_payload(self, payload: bytes) -> None:
@@ -256,8 +341,19 @@ class GazeMouseApp:
             x, y,               # gaze_point_2d_norm — final filtered combined 2D gaze
             x_L, y_L,           # gaze_point_2d_L_norm
             x_R, y_R,           # gaze_point_2d_R_norm
-            *_rest,             # everything else (3D points, display-space variants, etc.)
+            *_rest,             # 12 f64x3 blocks + trailing gaze_point_2d_unfiltered (2d)
         ) = struct.unpack(GAZE_STRUCT_FMT, payload[:GAZE_STRUCT_SIZE])
+
+        # _rest is a flat tuple: 12 x (x, y, z) blocks (36 doubles) followed
+        # by the final 2D unfiltered gaze point (2 doubles).
+        #
+        # ASSUMPTION (verify against tobiifree_core.zig — adjust the slice
+        # below if it doesn't match): per this file's own struct-layout
+        # comment, block order is "eye origins, trackbox pos, 3D gaze,
+        # display-space variants", so the first two 3D blocks are taken as
+        # the left/right eye origin.
+        origin_L = _rest[0:3]
+        origin_R = _rest[3:6]
 
         valid = self.eye_valid(vL, vR)
 
@@ -266,7 +362,40 @@ class GazeMouseApp:
             if self._debug_count <= 20 or self._debug_count % 60 == 0:
                 print(f"[gaze_mouse][debug] #{self._debug_count} vL={vL} vR={vR} "
                       f"x={x:.3f} y={y:.3f} valid={valid} paused={self.paused} "
-                      f"calib_mode={self.calibration_mode}", file=sys.stderr)
+                      f"calib_mode={self.calibration_mode} "
+                      f"head_corr={self.head_correction_enabled} "
+                      f"origin_L={origin_L} origin_R={origin_R}", file=sys.stderr)
+
+        # Publish decoded eye origins for display/debugging (calibration
+        # window readout and --print-eye-origin), independent of whether
+        # head-movement correction is enabled.
+        self.shared.update_origin(origin_L, origin_R, vL, vR)
+
+        if self.args.print_eye_origin:
+            now = time.monotonic()
+            if now - self._last_eye_origin_print >= (1.0 / self.args.print_eye_origin_rate):
+                self._last_eye_origin_print = now
+                print(
+                    f"[gaze_mouse][eye-origin] vL={vL} vR={vR} "
+                    f"L=({origin_L[0]:.2f}, {origin_L[1]:.2f}, {origin_L[2]:.2f}) "
+                    f"R=({origin_R[0]:.2f}, {origin_R[1]:.2f}, {origin_R[2]:.2f})",
+                    file=sys.stderr,
+                )
+
+        # Update the eye-origin / head-movement tracking regardless of gaze
+        # validity for x/y, as long as at least one eye's origin is valid.
+        # This runs whether or not head correction is currently enabled, so
+        # that re-enabling it doesn't see a huge stale delta (see
+        # _toggle_head_correction, which clears _prev_origin_xy on toggle).
+        origin_xy = self._pick_origin_xy(origin_L, origin_R, vL, vR)
+        if origin_xy is not None:
+            if self.head_correction_enabled:
+                if self._prev_origin_xy is not None:
+                    dx = origin_xy[0] - self._prev_origin_xy[0]
+                    dy = origin_xy[1] - self._prev_origin_xy[1]
+                    self.head_offset_x += dx * self.args.head_gain
+                    self.head_offset_y += dy * self.args.head_gain
+            self._prev_origin_xy = origin_xy
 
         if not valid:
             self.shared.update(self.shared.raw_x, self.shared.raw_y, False)
@@ -291,8 +420,17 @@ class GazeMouseApp:
             return
 
         corr_x, corr_y = self.calib.compute_correction(raw_px, raw_py)
-        px = int(min(max(raw_px + corr_x, 0), self.width - 1))
-        py = int(min(max(raw_py + corr_y, 0), self.height - 1))
+        px = raw_px + corr_x
+        py = raw_py + corr_y
+
+        if self.head_correction_enabled:
+            px += self.head_offset_x
+            py -= self.head_offset_y
+            #print(f"[gaze_mouse] head-correction offset applied: "
+            #      f"({self.head_offset_x:.2f}, {self.head_offset_y:.2f})")
+
+        px = int(min(max(px, 0), self.width - 1))
+        py = int(min(max(py, 0), self.height - 1))
 
         self.ui.write(e.EV_ABS, e.ABS_X, px)
         self.ui.write(e.EV_ABS, e.ABS_Y, py)
@@ -387,12 +525,19 @@ class GazeMouseApp:
             msg = font.render("waiting for valid gaze data...", True, (200, 60, 60))
             screen.blit(msg, (20, self.height - 40))
 
+        origin_L, origin_R, ovL, ovR = self.shared.get_origin()
         lines = [
             "Left-click: add calibration point at this spot",
             "Right-click: remove nearest calibration point",
             f"+ / - : adjust radius (currently {int(self.calib.default_radius)}px)",
             "C: clear all calibration points",
             f"{len(self.calib.points)} calibration point(s) stored",
+            f"Head-movement correction (SIGUSR3): "
+            f"{'ON' if self.head_correction_enabled else 'off'} (gain={self.args.head_gain})",
+            f"eye_origin_L_mm (v={ovL}): "
+            f"({origin_L[0]:.1f}, {origin_L[1]:.1f}, {origin_L[2]:.1f})",
+            f"eye_origin_R_mm (v={ovR}): "
+            f"({origin_R[0]:.1f}, {origin_R[1]:.1f}, {origin_R[2]:.1f})",
             "Send SIGUSR2 again to exit calibration",
         ]
         for i, line in enumerate(lines):
@@ -439,7 +584,8 @@ class GazeMouseApp:
         self._hide_calibration_window()
 
         print(f"[gaze_mouse] pid={os.getpid()} — hotkeys: SIGUSR1 pause/resume, "
-              f"SIGUSR2 toggle calibration (kill -USR1/-USR2 {os.getpid()})", file=sys.stderr)
+              f"SIGUSR2 toggle calibration, SIGUSR3 (SIGRTMIN) toggle head-movement "
+              f"correction (kill -USR1/-USR2/-SIGRTMIN {os.getpid()})", file=sys.stderr)
 
         clock = pygame.time.Clock()
         while not self._stop.is_set():
@@ -461,7 +607,8 @@ class GazeMouseApp:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Map tobiifreed gaze data to the mouse cursor via uinput, "
-                                             "with an on-demand calibration GUI.")
+                                             "with an on-demand calibration GUI and optional eye-origin "
+                                             "head-movement correction.")
     p.add_argument("--socket", default=default_socket_path(),
                     help="Path to tobiifreed's unix socket (default: $XDG_RUNTIME_DIR/tobiifreed/gaze.sock)")
     p.add_argument("--width", type=int, default=None, help="Screen width in pixels (default: auto-detect via xrandr)")
@@ -474,11 +621,24 @@ def parse_args():
                     help="Seconds to wait before reconnecting after a lost connection (default: 2)")
     p.add_argument("--debug", action="store_true",
                     help="Print raw/parsed gaze samples and non-gaze messages to stderr")
+    p.add_argument("--print-eye-origin", action="store_true",
+                    help="Continuously print the decoded left/right eye origin "
+                         "(eye_origin_L_mm / eye_origin_R_mm) to stderr, throttled to "
+                         "--print-eye-origin-rate Hz. Useful for verifying the struct "
+                         "extraction is correct.")
+    p.add_argument("--print-eye-origin-rate", type=float, default=5.0,
+                    help="Max prints per second for --print-eye-origin (default: 5)")
     p.add_argument("--calib-file", default=DEFAULT_CALIB_PATH,
                     help=f"Path to calibration points JSON file (default: {DEFAULT_CALIB_PATH})")
     p.add_argument("--radius", type=float, default=None,
                     help=f"Initial calibration correction radius in pixels "
                          f"(default: {DEFAULT_RADIUS}, or whatever is stored in the calib file)")
+    p.add_argument("--head-gain", type=float, default=1.0,
+                    help="Gain applied to frame-to-frame eye-origin (head) movement when "
+                         "head-movement correction is toggled on via SIGUSR3 (SIGRTMIN); "
+                         "the resulting scaled delta is accumulated into the mouse x/y "
+                         "position each frame. Units depend on tobiifreed's eye-origin "
+                         "coordinate system (often mm) — tune to taste (default: 1.0)")
     args = p.parse_args()
 
     if args.width is None or args.height is None:
