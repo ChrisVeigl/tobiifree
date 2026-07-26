@@ -159,33 +159,35 @@ found 2 CAI container(s)
   [1] off=0x12b3c28 size=45665 version=t2srv:02a1a6a977 -> fw_extracted//cai_1_t2srv_02a1a6a977.bin
 ```
 
-Still, i am unsure if this is correct and the flash tool would work, as i don't want to brick the only ET-5 I have here ;)
+Still, i am unsure if this is correct anecho uinput | sudo tee /etc/modules-load.d/uinput.conf
+d the flash tool would work, as i don't want to brick the only ET-5 I have here ;)
 does this look correct? - and: how can a ET-5 in runtime mode be put into bootloader mode for accepting new firmware?
 
 
 ## Building / Running on RaspberryPi
 
-### Install Nix and other dependecies on the RaspberryPi:
-
+### Install Nix and other dependecies on the RaspberryPi, mostly described in the Aetherall's readme:
+* get Nix from nixos.org
 ```
 curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install | sh -s -- --daemon
 ```
-
-* run the ./start_nix.sh script. (first time will install dependencies which will take a while).
 * change the following line in flake.nix:
-
 ```
     # system = "x86_64-linux";
     system = "aarch64-linux";
 ```
-
+* run the ./start_nix.sh script. (first time will install dependencies which will take a while)
+* install the udev rules for granting USB access:
+```
+sudo cp assets/99-tobii.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+```
 * run ```npm install``` in the repository root folder to install vite for the web demo.
 
 
 ### Mouse emulation
 
 because of the restrictions Wayland imposes to system-wide mouse cursor control, uinput was used, which needs its own udev rule:
-
 ```
 sudo groupadd uinput
 sudo usermod -aG uinput $USER
@@ -194,23 +196,17 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-In case of access problem to uinput (for mouse emulation):
+In case of access problems to uinput (for mouse emulation) make sure the module is loaded; if not, add it to modules-load.d using
 ```
- sudo chgrp uinput /dev/uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 ```
-
-or if this does not help try this temporary workaround
-```
- sudo chown pi /dev/uinput
-```
-
 
 
 ## Other remarks and findings 
 
 
 ### USB access problems in Chrome
-USB access for the Web demo did not work in Chrome (althouth udev rules were correctly installed), unless I enabled the web browser access rights via snap:
+USB access for the Web demo did not work in Chrome (Laptop running Ubuntu, althouth udev rules were correctly installed), unless I enabled the web browser access rights via snap:
 (only relevant if the browser was installed via the snap package manager)
 
 ```
@@ -226,7 +222,7 @@ it appears your Wayland compositor does not support the Session Lock protocol
 ** (tobiifree-overlay:15852): WARNING **: 21:08:00.664: Failed to initialize layer surface, it appears your Wayland compositor doesn't support Layer Shell
 ```
 
-It seems that the gtk4-layer-shell Wayland extension fails to initialize on my desktop (I am using Ubuntu with Gnome/Mutter).
+It seems that the gtk4-layer-shell Wayland extension fails to initialize on my laptop (Ubuntu with Gnome/Mutter).
 
 I added log messages to main.zig and found that the gaze x/y coordinates looked good (normalized to 0..1 for the x/y gaze location when looking around at the screen),
 but the mapped screen coordinates where completely wrong, e.g:
