@@ -90,17 +90,6 @@ Options:
   --click-dwell-ms <int>  Time in ms gaze must remain in radius to click (default: 1000)
 ```
 
-Because of the restrictions Wayland imposes to system-wide mouse cursor control, uinput was used, which needs its own udev rule:
-
-```
-sudo groupadd uinput
-sudo usermod -aG uinput $USER
-echo 'KERNEL=="uinput", GROUP="uinput", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-
 The mouse activities can be paused/unpaused using a system-wide hotkey (defined in the Linux Desktop keyboard settings) which sends the signal SIGUSR1 to the running task, using:
 The calibration GUI can be shown/hidden by sending SIGUSR2, e.g.:
 
@@ -135,15 +124,34 @@ does this look correct? - and: how can a ET-5 in runtime mode be put into bootlo
 
 ## Building / Running on RaspberryPi
 
-For building on a raspberrpiPi change the following line in flake.nix:
+### Install Nix and other dependecies on the RaspberryPi:
+
+```
+curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install | sh -s -- --daemon
+```
+
+* run the ./start_nix.sh script. (first time will install dependencies which will take a while).
+* change the following line in flake.nix:
+
 ```
     # system = "x86_64-linux";
     system = "aarch64-linux";
 ```
 
-and run ```npm install``` in the repository root folder to install vite for the web demo.
+* run ```npm install``` in the repository root folder to install vite for the web demo.
 
 
+### Mouse emulation
+
+because of the restrictions Wayland imposes to system-wide mouse cursor control, uinput was used, which needs its own udev rule:
+
+```
+sudo groupadd uinput
+sudo usermod -aG uinput $USER
+echo 'KERNEL=="uinput", GROUP="uinput", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
 
 In case of access problem to uinput (for mouse emulation):
 ```
