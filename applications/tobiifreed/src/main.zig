@@ -416,14 +416,15 @@ pub fn main() void {
     defer tracker.deinit();
 
     // Apply display area from config only if device was power-cycled (reset to tiny default).
-    if (tracker.display.isReset()) {
-        log.info("device display area looks reset, applying config", .{});
+    // if (tracker.display.isReset()) {
+        //log.info("device display area looks reset, applying config", .{});
+        log.info("setting display area from config", .{});
         if (!tracker.setDisplayArea(display)) {
             log.warn("failed to set display area from config", .{});
         }
-    } else {
-        log.info("device display area preserved from previous session", .{});
-    }
+    //} else {
+    //    log.info("device display area preserved from previous session", .{});
+    //}
     tracker.onGaze(onGaze);
 
     // Install response hook for command forwarding.
