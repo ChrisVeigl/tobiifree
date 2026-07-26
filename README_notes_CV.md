@@ -82,20 +82,61 @@ It also features client-side calibration and gaze position correction, using a b
 
 
 ```
-Usage: tobiifree-mouse [options]
+usage: gaze_mouse.py [-h] [--socket SOCKET] [--width WIDTH] [--height HEIGHT] [--eye {left,right,both,either}] [--smoothing SMOOTHING]
+                     [--retry-delay RETRY_DELAY] [--debug] [--print-eye-origin] [--print-eye-origin-rate PRINT_EYE_ORIGIN_RATE]
+                     [--calib-file CALIB_FILE] [--radius RADIUS] [--head-gain HEAD_GAIN]
 
-Options:
-  --click                 Enable dwell clicking (disabled by default)
-  --click-radius <float>  Normalized radius for dwell bounding box (default: 0.05)
-  --click-dwell-ms <int>  Time in ms gaze must remain in radius to click (default: 1000)
+Map tobiifreed gaze data to the mouse cursor via uinput, with an on-demand calibration GUI and optional eye-origin head-movement
+correction.
+
+options:
+  -h, --help            show this help message and exit
+  --socket SOCKET       Path to tobiifreed's unix socket (default: $XDG_RUNTIME_DIR/tobiifreed/gaze.sock)
+  --width WIDTH         Screen width in pixels (default: auto-detect via xrandr)
+  --height HEIGHT       Screen height in pixels (default: auto-detect via xrandr)
+  --eye {left,right,both,either}
+                        Which eye's validity to require (default: either)
+  --smoothing SMOOTHING
+                        Exponential moving average factor in (0,1]; 0 disables smoothing (default: 0)
+  --retry-delay RETRY_DELAY
+                        Seconds to wait before reconnecting after a lost connection (default: 2)
+  --debug               Print raw/parsed gaze samples and non-gaze messages to stderr
+  --print-eye-origin    Continuously print the decoded left/right eye origin (eye_origin_L_mm / eye_origin_R_mm) to stderr, throttled to
+                        --print-eye-origin-rate Hz. Useful for verifying the struct extraction is correct.
+  --print-eye-origin-rate PRINT_EYE_ORIGIN_RATE
+                        Max prints per second for --print-eye-origin (default: 5)
+  --calib-file CALIB_FILE
+                        Path to calibration points JSON file (default: /home/pi/work/github/tobiifree/applications/python-
+                        mouse/calib_points.json)
+  --radius RADIUS       Initial calibration correction radius in pixels (default: 300, or whatever is stored in the calib file)
+  --head-gain HEAD_GAIN
+                        Gain applied to frame-to-frame eye-origin (head) movement when head-movement correction is toggled on via
+                        SIGUSR3 (SIGRTMIN); the resulting scaled delta is accumulated into the mouse x/y position each frame. Units
+                        depend on tobiifreed's eye-origin coordinate system (often mm) — tune to taste (default: 15.0)
 ```
 
-The mouse activities can be paused/unpaused using a system-wide hotkey (defined in the Linux Desktop keyboard settings) which sends the signal SIGUSR1 to the running task, using:
-The calibration GUI can be shown/hidden by sending SIGUSR2, e.g.:
+The mouse activities can be paused/unpaused using a system-wide hotkey (defined in the Linux Desktop keyboard settings) which sends signals to the running task (SIGUSR1 pause/resume, SIGUSR2 toggle calibration, SIGUSR3 (SIGRTMIN) toggle head-movement correction).
+On raspian (using labwc), add the hotkeys to  ~/.config/labwc/rc.xml, e.g.
+```
+<keyboard>
+  <keybind key="A-m">
+    <action name="Execute">
+      <command>pkill -USR1 -f gaze_mouse.py</command>
+    </action>
+  </keybind>
+  <keybind key="A-c">
+    <action name="Execute">
+      <command>pkill -USR2 -f gaze_mouse.py</command>
+    </action>
+  </keybind>
+  <keybind key="A-h">
+    <action name="Execute">
+      <command>pkill -SIGRTMIN -f gaze_mouse.py</command>
+    </action>
+  </keybind>
+</keyboard>
+```
 
-```
-pkill -SIGUSR1 gaze_mouse 
-```
 
 
 ## Firmware extraction

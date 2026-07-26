@@ -633,12 +633,12 @@ def parse_args():
     p.add_argument("--radius", type=float, default=None,
                     help=f"Initial calibration correction radius in pixels "
                          f"(default: {DEFAULT_RADIUS}, or whatever is stored in the calib file)")
-    p.add_argument("--head-gain", type=float, default=1.0,
+    p.add_argument("--head-gain", type=float, default=15.0,
                     help="Gain applied to frame-to-frame eye-origin (head) movement when "
                          "head-movement correction is toggled on via SIGUSR3 (SIGRTMIN); "
                          "the resulting scaled delta is accumulated into the mouse x/y "
                          "position each frame. Units depend on tobiifreed's eye-origin "
-                         "coordinate system (often mm) — tune to taste (default: 1.0)")
+                         "coordinate system (often mm) — tune to taste (default: 15.0)")
     args = p.parse_args()
 
     if args.width is None or args.height is None:
