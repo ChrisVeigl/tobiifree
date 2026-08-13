@@ -248,36 +248,38 @@ pub const Tracker = struct {
     }
 
     fn driveStateMachine(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8) bool {
-        var max_steps: u32 = 0;
-        while (max_steps < 200) : (max_steps += 1) {
+        var steps: u32 = 0;
+        const start_ms = std.time.milliTimestamp();
+        while (std.time.milliTimestamp() - start_ms < 15000) : (steps += 1) {
             const action: core.HandshakeAction = @enumFromInt(poll_fn());
             switch (action) {
                 .send => {
                     const len = core.session_out_len_();
-                    log.debug("{s} step {d}: send {d} bytes", .{ label, max_steps, len });
+                    log.debug("{s} step {d}: send {d} bytes", .{ label, steps, len });
                     if (len > 0) {
                         if (!self.send_fn(core.session_out_ptr()[0..len])) {
-                            log.err("{s}: send failed at step {d}", .{ label, max_steps });
+                            log.err("{s}: send failed at step {d}", .{ label, steps });
                             return false;
                         }
                     }
                     self.drainReads(10);
                 },
                 .recv => {
-                    log.debug("{s} step {d}: recv", .{ label, max_steps });
+                    // Only log intermittently to avoid spam
+                    if (steps % 100 == 0) log.debug("{s} step {d}: recv", .{ label, steps });
                     self.drainReads(5);
                 },
                 .done => {
-                    log.info("{s} complete in {d} steps", .{ label, max_steps });
+                    log.info("{s} complete in {d} steps", .{ label, steps });
                     return true;
                 },
                 .err => {
-                    log.err("{s} failed at step {d}", .{ label, max_steps });
+                    log.err("{s} failed at step {d}", .{ label, steps });
                     return false;
                 },
             }
         }
-        log.err("{s} timed out after 200 steps", .{label});
+        log.err("{s} timed out after 15s ({} steps)", .{label, steps});
         return false;
     }
 
