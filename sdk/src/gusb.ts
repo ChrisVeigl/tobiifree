@@ -84,9 +84,17 @@ export class GUsbTransport implements Transport {
   }
 
   async send(bytes: Uint8Array): Promise<void> {
-    const [ok, written] = this.device.bulk_transfer(EP_OUT, bytes, TRANSFER_TIMEOUT);
-    if (!ok || written !== bytes.byteLength) {
-      throw new Error(`bulk OUT failed: wrote ${written}/${bytes.byteLength}`);
+    // Chunk at 8192 B — same FIFO-full fix as webusb.ts.
+    const CHUNK = 8192;
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const end = Math.min(offset + CHUNK, bytes.byteLength);
+      const chunk = bytes.subarray(offset, end);
+      const [ok, written] = this.device.bulk_transfer(EP_OUT, chunk, TRANSFER_TIMEOUT);
+      if (!ok || written !== chunk.byteLength) {
+        throw new Error(`bulk OUT chunk @${offset}: wrote ${written}/${chunk.byteLength}`);
+      }
+      offset = end;
     }
   }
 
