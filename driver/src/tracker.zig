@@ -26,6 +26,11 @@ pub const Tracker = struct {
     connected: bool,
     gaze_cb: ?GazeFn,
     display: DisplayCorners,
+    /// When true, poll() returns immediately so that the main thread owns all
+    /// USB reads during calibration state machines. This prevents concurrent
+    /// feed_usb_in calls (and the integer overflow they cause) without a mutex
+    /// that would deadlock because poll() holds a lock during a blocking read.
+    calibrating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const SendFn = *const fn (data: []const u8) bool;
     pub const RecvFn = *const fn (buf: []u8) ?usize;
@@ -146,8 +151,11 @@ pub const Tracker = struct {
 
     /// Poll for USB data. First read blocks until data arrives (device-paced).
     /// Subsequent reads are non-blocking to drain any buffered packets.
+    /// Returns immediately (no reads) while a calibration state machine is running
+    /// so that the main thread owns all USB I/O exclusively.
     pub fn poll(self: *Tracker) void {
         if (!self.connected) return;
+        if (self.calibrating.load(.acquire)) return;
         active = self;
 
         var buf: [16384]u8 = undefined;
@@ -225,20 +233,41 @@ pub const Tracker = struct {
     // ── Calibration ─────────────────────────────────────────────────
 
     pub fn startCalibration(self: *Tracker) bool {
+        self.calibrating.store(true, .release);
+        defer self.calibrating.store(false, .release);
+        // Give the USB thread time to finish any in-flight blocking read before
+        // the main thread starts issuing its own reads via drainReads.
+        std.Thread.sleep(30_000_000); // 30 ms
+        // Step 1: unlock the calibration realm.
         core.cal_start_init();
-        return self.driveStateMachine(&core.cal_start_poll, "cal_start");
+        if (!self.driveStateMachine(&core.cal_start_poll, "cal_realm")) return false;
+
+        // Step 2: open a calibration session (CALIBRATE_START).
+        // Without this the device acks every added point and discards it,
+        // so the flow completes with no errors while leaving the calibration unchanged.
+        if (!self.sendAndAwait(core.request_cal_start, "cal_start")) return false;
+
+        // Step 3: drop any previously collected points (ok if the device rejects it).
+        _ = self.sendAndAwait(core.request_cal_clear, "cal_clear");
+
+        return true;
     }
 
     pub fn finishCalibration(self: *Tracker) bool {
+        self.calibrating.store(true, .release);
+        defer self.calibrating.store(false, .release);
         core.cal_finish_init();
         return self.driveStateMachine(&core.cal_finish_poll, "cal_finish");
     }
 
     pub fn calApply(self: *Tracker, blob: []const u8) bool {
+        self.calibrating.store(true, .release);
+        defer self.calibrating.store(false, .release);
         const scratch = core.scratch_ptr();
         @memcpy(scratch[0..blob.len], blob);
         core.cal_apply_init(@intCast(blob.len));
-        return self.driveStateMachine(&core.cal_apply_poll, "cal_apply");
+        // 120 s: realm unlock + large blob send + device processing + close realm
+        return self.driveStateMachineMs(&core.cal_apply_poll, "cal_apply", 120_000);
     }
 
     // ── State machine driver ─────────────────────────────────────────
@@ -247,10 +276,44 @@ pub const Tracker = struct {
         return self.driveStateMachine(&core.handshake_poll, "handshake");
     }
 
+    /// Send a single TTP request and wait for its response.
+    /// Returns true if a response was received, false on send failure or timeout.
+    fn sendAndAwait(self: *Tracker, build_fn: *const fn () callconv(.c) u32, label: [*:0]const u8) bool {
+        // Save and restore the active response hook so that hooks installed by
+        // the caller (e.g. the daemon's onResponse for command forwarding) are
+        // not permanently overwritten by the temporary captureResponse hook.
+        const saved_hook = core.get_response_hook();
+        core.set_hooks(null, null, captureResponse, null, null);
+        defer core.set_hooks(null, null, saved_hook, null, null);
+        const req_id = build_fn();
+        captured_request_id = req_id;
+        captured_payload = null;
+        const out_len = core.session_out_len_();
+        if (out_len == 0) {
+            log.err("{s}: empty output", .{label});
+            return false;
+        }
+        if (!self.send_fn(core.session_out_ptr()[0..out_len])) {
+            log.err("{s}: send failed", .{label});
+            return false;
+        }
+        self.drainReads(30);
+        if (captured_payload == null) {
+            log.warn("{s}: no response", .{label});
+            return false;
+        }
+        log.debug("{s}: ok ({} bytes)", .{ label, captured_payload.?.len });
+        return true;
+    }
+
     fn driveStateMachine(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8) bool {
+        return self.driveStateMachineMs(poll_fn, label, 15_000);
+    }
+
+    fn driveStateMachineMs(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8, timeout_ms: i64) bool {
         var steps: u32 = 0;
         const start_ms = std.time.milliTimestamp();
-        while (std.time.milliTimestamp() - start_ms < 15000) : (steps += 1) {
+        while (std.time.milliTimestamp() - start_ms < timeout_ms) : (steps += 1) {
             const action: core.HandshakeAction = @enumFromInt(poll_fn());
             switch (action) {
                 .send => {
@@ -279,7 +342,7 @@ pub const Tracker = struct {
                 },
             }
         }
-        log.err("{s} timed out after 15s ({} steps)", .{label, steps});
+        log.err("{s} timed out after {}ms ({} steps)", .{label, timeout_ms, steps});
         return false;
     }
 
