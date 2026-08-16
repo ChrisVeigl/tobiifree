@@ -140,10 +140,31 @@ fn onResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void 
             w.sendToClient(entry.client_fd, buf[0..msg_len]);
         }
     } else {
-        _ = std.posix.write(entry.client_fd, buf[0..msg_len]) catch {};
+        writeAll(entry.client_fd, buf[0..msg_len]);
     }
 
     log.debug("routed response for cmd=0x{x:0>2} to fd={}", .{ entry.cmd_type, entry.client_fd });
+}
+
+/// Write all bytes to a (possibly non-blocking) socket fd.
+/// Client sockets are accepted with SOCK_NONBLOCK, so write() may return EAGAIN
+/// when the kernel send buffer is full. We use poll(POLLOUT) to wait until space
+/// is available before retrying rather than silently dropping bytes.
+fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
+    var remaining = data;
+    while (remaining.len > 0) {
+        const n = std.posix.write(fd, remaining) catch |err| {
+            if (err == error.WouldBlock) {
+                // Buffer full — wait until the fd is writable (up to 5 s).
+                var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+                _ = std.posix.poll(&pfd, 5000) catch return;
+                continue;
+            }
+            return; // real error (EPIPE, EBADF, …) — give up
+        };
+        if (n == 0) return;
+        remaining = remaining[n..];
+    }
 }
 
 /// Forward a daemon-protocol command to the USB tracker.
@@ -173,11 +194,15 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
             }
         },
         .cal_apply => {
+            log.debug("cal_apply: received payload_len={d} from fd={d}", .{ payload.len, client_fd });
             if (payload.len == 0) {
+                log.warn("cal_apply: empty payload, sending error", .{});
                 sendResult(client_fd, cmd_type, is_ws, false, &.{});
                 return;
             }
+            log.debug("cal_apply: calling tracker.calApply", .{});
             const ok = tracker.calApply(payload);
+            log.debug("cal_apply: tracker.calApply returned ok={}", .{ok});
             sendResult(client_fd, cmd_type, is_ws, ok, &.{});
         },
 
@@ -224,7 +249,7 @@ fn buildRequest(cmd: proto.Cmd, payload: []const u8) ?u32 {
             if (payload.len < 16) break :blk null; // x(f64) + y(f64) = 16
             var f: [2]f64 = undefined;
             @memcpy(std.mem.asBytes(&f), payload[0..16]);
-            break :blk core.request_cal_add_point(f[0], f[1], 0);
+            break :blk core.request_cal_point_add2d(f[0], f[1], 3); // eye_mask=3: both eyes
         },
         .subscribe, .disconnect, .start_calibration, .finish_calibration, .cal_apply => null,
     };
@@ -241,13 +266,27 @@ fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, pa
         }
         return;
     }
-    var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
-    const msg_len = proto.encodeResponse(&buf, cmd_type, payload);
     if (is_ws) {
+        // WS framing requires a contiguous buffer. Calibration blobs are not
+        // expected over WebSocket; log and skip rather than stack-overflow.
+        if (payload.len > 8192) {
+            log.warn("sendResult: WS payload too large ({} bytes), skipping", .{payload.len});
+            return;
+        }
+        var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
+        const msg_len = proto.encodeResponse(&buf, cmd_type, payload);
         if (ws) |*w| w.sendToClient(client_fd, buf[0..msg_len]);
-    } else {
-        _ = std.posix.write(client_fd, buf[0..msg_len]) catch {};
+        return;
     }
+    // Unix socket path: write framing header + cmd_type first, then the payload.
+    // Two writes on a SOCK_STREAM socket are ordered and contiguous from the
+    // reader's perspective, so this is safe for arbitrarily large payloads
+    // (e.g. calibration blobs of hundreds of kilobytes).
+    var hdr: [proto.HEADER_SIZE + 1]u8 = undefined;
+    proto.encodeHeader(hdr[0..proto.HEADER_SIZE], @intFromEnum(proto.Srv.response), @intCast(1 + payload.len));
+    hdr[proto.HEADER_SIZE] = cmd_type;
+    writeAll(client_fd, &hdr);
+    if (payload.len > 0) writeAll(client_fd, payload);
 }
 
 // ── Config loading (same as overlay) ────────────────────────────────
@@ -416,22 +455,21 @@ pub fn main() void {
     defer tracker.deinit();
 
     // Apply display area from config only if device was power-cycled (reset to tiny default).
-    // if (tracker.display.isReset()) {
-        //log.info("device display area looks reset, applying config", .{});
-        log.info("setting display area from config", .{});
+    if (tracker.display.isReset()) {
+        log.info("device display area looks reset, applying config", .{});
         if (!tracker.setDisplayArea(display)) {
             log.warn("failed to set display area from config", .{});
         }
-    //} else {
-    //    log.info("device display area preserved from previous session", .{});
-    //}
+    } else {
+        log.info("device display area preserved from previous session", .{});
+    }
     tracker.onGaze(onGaze);
 
     // Install response hook for command forwarding.
     core.set_hooks(null, null, onResponse, null, null);
 
     // Start socket server.
-    server = Server.init(&forwardCommand) catch |err| {
+    server.init(&forwardCommand) catch |err| {
         log.err("failed to start server: {}", .{err});
         return;
     };
