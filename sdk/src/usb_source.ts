@@ -215,12 +215,18 @@ export class UsbSource implements Source {
     log('finishCalibration');
     await this.calRequest(() => this.core.requestCalPointsApply(), 120_000);
     await this.calRequest(() => this.core.requestCalStop());
-    const blob = await this.calRequest(() => this.core.requestCalRetrieve(), 60_000);
+    const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), 60_000);
     if (this.core.hadTruncation()) {
       throw new Error(
-        `calibration blob was truncated to the wasm buffer (got ${blob.byteLength} bytes) — ` +
+        `calibration blob was truncated to the wasm buffer (got ${rawBlob.byteLength} bytes) — ` +
         'do not apply it; raise CAL_BLOB_MAX');
     }
+    // Every TTP response payload begins with a 2-byte status prefix 
+    // that all other decoders skip (r.pos = 2).
+    // build_cal_apply prepends its own [00 00] when applying, so the blob
+    // stored/returned must be the raw data WITHOUT that prefix.
+    // Keeping the prefix would cause calApply to send [00 00][00 00][data]
+    const blob = rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
     return blob;
   }
 
