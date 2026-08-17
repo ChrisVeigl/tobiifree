@@ -1,49 +1,50 @@
 #!/usr/bin/env python3
 """
 gaze_mouse.py — drive the mouse cursor from tobiifreed's gaze stream,
-with an on-demand fullscreen calibration GUI and optional eye-origin
+with an on-demand fullscreen gaze correction window and optional eye-origin
 head-movement correction.
 
 Connects to the tobiifreed unix socket, subscribes to gaze data, and maps
 the normalized (0..1) gaze coordinates to absolute screen coordinates
 using a virtual uinput device (absolute pointer).
 
-Three hotkeys (bind these in your Linux desktop environment):
+Actions are triggered by writing newline-terminated commands to a named
+pipe (FIFO). Use the companion gaze-ctl script to send commands — it is a
+plain executable that the hotkey daemon can invoke directly without any
+shell interpretation (no redirection or variable expansion needed on the
+hotkey daemon's side):
+    gaze-ctl toggle_pause             # pause/resume gaze -> mouse
+    gaze-ctl toggle_correction_window # show/hide the gaze correction window
+    gaze-ctl toggle_head_correction   # toggle eye-origin head-movement correction
+    gaze-ctl calibrate                # run the onboard calibration (calibrate.py)
 
-    SIGUSR1 — pause/resume gaze -> mouse control
-    SIGUSR2 — toggle the fullscreen calibration window
-    SIGUSR3 — toggle eye-origin head-movement correction
-              (NOTE: Linux has no real SIGUSR3. This is implemented using
-              the SIGRTMIN real-time signal instead — send that signal to
-              get the same effect; it's just referred to as "SIGUSR3"
-              throughout this file and its messages for convenience.)
+Parameterised commands are also supported:
+    gaze-ctl smoothing 0.3   # set EMA smoothing factor
+    gaze-ctl head_gain 20.0  # set head-movement gain
 
-While the calibration window is open, mouse emulation is bypassed
+The FIFO lives at /run/user/<uid>/gaze_mouse.fifo (i.e. the default
+$XDG_RUNTIME_DIR). Override with --fifo when starting gaze_mouse.py and
+set the GAZE_MOUSE_FIFO env var accordingly for gaze-ctl.
+
+While the gaze correction window is open, mouse emulation is bypassed
 entirely (your real mouse/touchpad works normally) so you can click on
 targets. A red dot follows your *raw*, uncorrected gaze so you can see
-the tracker's current error. Left-click anywhere to record a calibration
+the tracker's current error. Left-click anywhere to record a correction
 point at that location (storing the offset between where you clicked and
 where the tracker thought you were looking); a green dot shows the corrected
-gaze position. Right-click removes the nearest calibration point.
+gaze position. Right-click removes the nearest correction point.
 Points are saved to calib_points.json immediately and reloaded automatically
 on the next run.
 
-Eye-origin head-movement correction (SIGUSR3 / SIGRTMIN) is a separate,
-optional layer on top of the calibration-point correction. While enabled,
-frame-to-frame changes in eye origin position (i.e. how much your head has
-moved since the last sample) are scaled by a gain factor and accumulated
-into an extra x/y offset added to the mapped mouse position. This can help
-compensate for gaze-mapping drift caused by head movement between/during
-calibration. Toggling it off and back on resets the accumulated offset and
+Eye-origin head-movement correction is a separate, optional layer on top
+of the correction-point gaze correction. While enabled, frame-to-frame
+changes in eye origin position (i.e. how much your head has moved since the
+last sample) are scaled by a gain factor and accumulated into an extra x/y
+offset added to the mapped mouse position. This can help compensate for
+gaze-mapping drift caused by head movement between/during correction
+sessions. Toggling it off and back on resets the accumulated offset and
 re-baselines against the eye origin at the moment it's re-enabled, so there
 is no jump discontinuity.
-
-    kill -USR1 <pid>          # pause/resume
-    kill -USR2 <pid>          # toggle calibration window
-    kill -SIGRTMIN <pid>      # toggle eye-origin head-movement correction ("SIGUSR3")
-    pkill -USR1 -f gaze_mouse.py
-    pkill -USR2 -f gaze_mouse.py
-    pkill -SIGRTMIN -f gaze_mouse.py
 
 Requires:
     pip install evdev pygame
@@ -79,6 +80,8 @@ math; the protocol/struct details are unchanged from before:
 import argparse
 import os
 import re
+import pathlib
+import select
 import signal
 import socket
 import struct
@@ -131,6 +134,13 @@ VALID = 0   # validity_L/validity_R: 0 == valid, 4 == not detected
 def default_socket_path() -> str:
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
     return os.path.join(runtime_dir, "tobiifreed", "gaze.sock")
+
+
+def default_fifo_path() -> str:
+    # Use /run/user/<uid> directly — this is the canonical XDG_RUNTIME_DIR
+    # location on systemd-based systems and avoids depending on the env var
+    # being set (it may not be in hotkey daemon or non-login contexts).
+    return f"/run/user/{os.getuid()}/gaze_mouse.fifo"
 
 
 # ── Screen size detection ───────────────────────────────────────────────
@@ -230,10 +240,10 @@ class GazeMouseApp:
         self.height = args.height
 
         self.paused = False
-        self.calibration_mode = False
-        self._displayed_calibration_mode = False  # what the pygame window currently shows
+        self.correction_window = False
+        self._displayed_correction_window = False  # whether the gaze correction window is currently shown
 
-        # Eye-origin head-movement correction state (toggled via SIGUSR3/SIGRTMIN).
+        # Eye-origin head-movement correction state (toggled via FIFO command).
         self.head_correction_enabled = False
         self.head_offset_x = 0.0
         self.head_offset_y = 0.0
@@ -247,28 +257,15 @@ class GazeMouseApp:
         self._debug_count = 0
 
         self._stop = threading.Event()
+        self._fifo_path = args.fifo
+        self._calibrating = False  # guard against concurrent calibration launches
 
-        signal.signal(signal.SIGUSR1, self._toggle_pause)
-        signal.signal(signal.SIGUSR2, self._toggle_calibration)
-        # True SIGUSR3 doesn't exist on Linux, so SIGRTMIN stands in for it.
-        # It's referred to as "SIGUSR3" in log messages for convenience.
-        self._head_correction_signal = signal.SIGRTMIN
-        signal.signal(self._head_correction_signal, self._toggle_head_correction)
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
 
-    # ---- signal handlers ----
+    # ---- command handlers ----
 
-    def _toggle_pause(self, signum, frame):
-        self.paused = not self.paused
-        print(f"[gaze_mouse] {'paused' if self.paused else 'resumed'}", file=sys.stderr)
-
-    def _toggle_calibration(self, signum, frame):
-        self.calibration_mode = not self.calibration_mode
-        print(f"[gaze_mouse] calibration window {'shown' if self.calibration_mode else 'hidden'}",
-              file=sys.stderr)
-
-    def _toggle_head_correction(self, signum, frame):
+    def _toggle_head_correction(self):
         self.head_correction_enabled = not self.head_correction_enabled
         # Reset the accumulated offset and the delta baseline every time this
         # is toggled (on OR off) so re-enabling never produces a jump: the
@@ -277,9 +274,107 @@ class GazeMouseApp:
         self.head_offset_x = 0.0
         self.head_offset_y = 0.0
         self._prev_origin_xy = None
-        print(f"[gaze_mouse] eye-origin head-movement correction (SIGUSR3) "
+        print(f"[gaze_mouse] eye-origin head-movement correction "
               f"{'enabled' if self.head_correction_enabled else 'disabled'} (offset reset)",
               file=sys.stderr)
+
+    def _dispatch_command(self, cmd: str) -> None:
+        parts = cmd.split(None, 1)
+        if not parts:
+            return
+        name = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+
+        if name == "toggle_pause":
+            self.paused = not self.paused
+            print(f"[gaze_mouse] {'paused' if self.paused else 'resumed'}", file=sys.stderr)
+        elif name == "pause":
+            self.paused = True
+            print("[gaze_mouse] paused", file=sys.stderr)
+        elif name == "resume":
+            self.paused = False
+            print("[gaze_mouse] resumed", file=sys.stderr)
+        elif name == "toggle_correction_window":
+            self.correction_window = not self.correction_window
+            print(f"[gaze_mouse] gaze correction window "
+                  f"{'shown' if self.correction_window else 'hidden'}", file=sys.stderr)
+        elif name == "toggle_head_correction":
+            self._toggle_head_correction()
+        elif name == "smoothing" and arg is not None:
+            try:
+                self.args.smoothing = float(arg)
+                print(f"[gaze_mouse] smoothing set to {self.args.smoothing}", file=sys.stderr)
+            except ValueError:
+                print(f"[gaze_mouse] invalid smoothing value: {arg!r}", file=sys.stderr)
+        elif name == "head_gain" and arg is not None:
+            try:
+                self.args.head_gain = float(arg)
+                print(f"[gaze_mouse] head_gain set to {self.args.head_gain}", file=sys.stderr)
+            except ValueError:
+                print(f"[gaze_mouse] invalid head_gain value: {arg!r}", file=sys.stderr)
+        elif name == "calibrate":
+            threading.Thread(target=self._launch_calibration, daemon=True).start()
+        else:
+            print(f"[gaze_mouse] unknown FIFO command: {cmd!r}", file=sys.stderr)
+
+    def _launch_calibration(self) -> None:
+        if self._calibrating:
+            print("[gaze_mouse] calibration already running", file=sys.stderr)
+            return
+
+        calibrate_script = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "python-calibrator" / "calibrate.py"
+        )
+        if not calibrate_script.exists():
+            print(f"[gaze_mouse] calibrate.py not found: {calibrate_script}", file=sys.stderr)
+            return
+
+        self._calibrating = True
+        was_paused = self.paused
+        self.paused = True  # suspend mouse emulation so the real mouse works during calibration
+        print("[gaze_mouse] starting calibration (gaze mouse paused)", file=sys.stderr)
+        try:
+            subprocess.run([sys.executable, str(calibrate_script)], check=False)
+        except Exception as exc:
+            print(f"[gaze_mouse] calibration subprocess error: {exc}", file=sys.stderr)
+        finally:
+            self._calibrating = False
+            self.paused = was_paused
+            print(
+                f"[gaze_mouse] calibration finished — gaze mouse "
+                f"{'still paused' if was_paused else 'resumed'}",
+                file=sys.stderr,
+            )
+
+    def _fifo_thread_main(self) -> None:
+        fifo = pathlib.Path(self._fifo_path)
+        fifo.unlink(missing_ok=True)
+        os.mkfifo(self._fifo_path, mode=0o600)
+        print(f"[gaze_mouse] FIFO ready: {self._fifo_path}", file=sys.stderr)
+        try:
+            while not self._stop.is_set():
+                # O_NONBLOCK avoids blocking on open when no writer is connected yet.
+                fd = os.open(self._fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    buf = ""
+                    while not self._stop.is_set():
+                        r, _, _ = select.select([fd], [], [], 0.5)
+                        if not r:
+                            continue
+                        chunk = os.read(fd, 4096)
+                        if not chunk:  # EOF: writer closed its end
+                            break
+                        buf += chunk.decode(errors="replace")
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if line:
+                                self._dispatch_command(line)
+                finally:
+                    os.close(fd)
+        finally:
+            fifo.unlink(missing_ok=True)
 
     def _shutdown(self, signum, frame):
         print("[gaze_mouse] shutting down", file=sys.stderr)
@@ -290,6 +385,10 @@ class GazeMouseApp:
             pass
         try:
             pygame.quit()
+        except Exception:
+            pass
+        try:
+            pathlib.Path(self._fifo_path).unlink(missing_ok=True)
         except Exception:
             pass
         sys.exit(0)
@@ -362,11 +461,11 @@ class GazeMouseApp:
             if self._debug_count <= 20 or self._debug_count % 60 == 0:
                 print(f"[gaze_mouse][debug] #{self._debug_count} vL={vL} vR={vR} "
                       f"x={x:.3f} y={y:.3f} valid={valid} paused={self.paused} "
-                      f"calib_mode={self.calibration_mode} "
+                      f"correction_window={self.correction_window} "
                       f"head_corr={self.head_correction_enabled} "
                       f"origin_L={origin_L} origin_R={origin_R}", file=sys.stderr)
 
-        # Publish decoded eye origins for display/debugging (calibration
+        # Publish decoded eye origins for display/debugging (gaze correction
         # window readout and --print-eye-origin), independent of whether
         # head-movement correction is enabled.
         self.shared.update_origin(origin_L, origin_R, vL, vR)
@@ -415,8 +514,8 @@ class GazeMouseApp:
         raw_py = y * (self.height - 1)
         self.shared.update(raw_px, raw_py, True)
 
-        # Calibration window bypasses mouse emulation entirely.
-        if self.calibration_mode or self.paused:
+        # Gaze correction window bypasses mouse emulation entirely.
+        if self.correction_window or self.paused:
             return
 
         corr_x, corr_y = self.calib.compute_correction(raw_px, raw_py)
@@ -465,18 +564,18 @@ class GazeMouseApp:
                       f"retrying in {self.args.retry_delay}s", file=sys.stderr)
                 time.sleep(self.args.retry_delay)
 
-    # ---- pygame calibration GUI (runs on the main thread) ----
+    # ---- pygame gaze correction window (runs on the main thread) ----
 
-    def _show_calibration_window(self) -> None:
+    def _show_correction_window(self) -> None:
         try:
             self.screen = pygame.display.set_mode((self.width, self.height), pygame.FULLSCREEN)
         except pygame.error:
             self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("Gaze calibration")
+        pygame.display.set_caption("Gaze position correction")
         pygame.mouse.set_visible(True)
         pygame.event.set_grab(False)
 
-    def _hide_calibration_window(self) -> None:
+    def _hide_correction_window(self) -> None:
         try:
             self.screen = pygame.display.set_mode((1, 1), pygame.HIDDEN)
         except pygame.error:
@@ -484,7 +583,7 @@ class GazeMouseApp:
             pygame.display.set_mode((200, 100))
             pygame.display.iconify()
 
-    def _draw_calibration_frame(self, font) -> None:
+    def _draw_correction_frame(self, font) -> None:
         screen = self.screen
         screen.fill((15, 15, 20))
 
@@ -527,18 +626,18 @@ class GazeMouseApp:
 
         origin_L, origin_R, ovL, ovR = self.shared.get_origin()
         lines = [
-            "Left-click: add calibration point at this spot",
-            "Right-click: remove nearest calibration point",
+            "Left-click: add correction point at this spot",
+            "Right-click: remove nearest correction point",
             f"+ / - : adjust radius (currently {int(self.calib.default_radius)}px)",
-            "C: clear all calibration points",
-            f"{len(self.calib.points)} calibration point(s) stored",
-            f"Head-movement correction (SIGUSR3): "
+            "C: clear all correction points",
+            f"{len(self.calib.points)} correction point(s) stored",
+            f"Head-movement correction: "
             f"{'ON' if self.head_correction_enabled else 'off'} (gain={self.args.head_gain})",
             f"eye_origin_L_mm (v={ovL}): "
             f"({origin_L[0]:.1f}, {origin_L[1]:.1f}, {origin_L[2]:.1f})",
             f"eye_origin_R_mm (v={ovR}): "
             f"({origin_R[0]:.1f}, {origin_R[1]:.1f}, {origin_R[2]:.1f})",
-            "Send SIGUSR2 again to exit calibration",
+            "Send 'toggle_correction_window' to FIFO to close",
         ]
         for i, line in enumerate(lines):
             txt = font.render(line, True, (230, 230, 230))
@@ -546,23 +645,23 @@ class GazeMouseApp:
 
         pygame.display.flip()
 
-    def _handle_calibration_events(self) -> None:
+    def _handle_correction_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                self.calibration_mode = False
+                self.correction_window = False
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:  # left click: add point
                     raw_x, raw_y, valid = self.shared.get()
                     if valid:
                         tx, ty = event.pos
                         self.calib.add_point(tx, ty, raw_x, raw_y)
-                        print(f"[gaze_mouse] calibration point added at ({tx},{ty}), "
+                        print(f"[gaze_mouse] correction point added at ({tx},{ty}), "
                               f"raw gaze was ({raw_x:.0f},{raw_y:.0f})", file=sys.stderr)
                     else:
                         print("[gaze_mouse] ignored click: no valid gaze data right now", file=sys.stderr)
                 elif event.button == 3:  # right click: remove nearest point
                     if self.calib.remove_nearest(*event.pos):
-                        print("[gaze_mouse] removed nearest calibration point", file=sys.stderr)
+                        print("[gaze_mouse] removed nearest correction point", file=sys.stderr)
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
                     self.calib.default_radius = min(2000, self.calib.default_radius + 10)
@@ -572,33 +671,34 @@ class GazeMouseApp:
                     self.calib.save()
                 elif event.key == pygame.K_c:
                     self.calib.clear()
-                    print("[gaze_mouse] cleared all calibration points", file=sys.stderr)
+                    print("[gaze_mouse] cleared all correction points", file=sys.stderr)
                 elif event.key == pygame.K_ESCAPE:
-                    self.calibration_mode = False
+                    self.correction_window = False
 
     def run(self) -> None:
         threading.Thread(target=self.gaze_thread_main, daemon=True).start()
+        threading.Thread(target=self._fifo_thread_main, daemon=True).start()
 
         pygame.init()
         font = pygame.font.SysFont(None, 24)
-        self._hide_calibration_window()
+        self._hide_correction_window()
 
-        print(f"[gaze_mouse] pid={os.getpid()} — hotkeys: SIGUSR1 pause/resume, "
-              f"SIGUSR2 toggle calibration, SIGUSR3 (SIGRTMIN) toggle head-movement "
-              f"correction (kill -USR1/-USR2/-SIGRTMIN {os.getpid()})", file=sys.stderr)
+        print(f"[gaze_mouse] pid={os.getpid()} — write commands to FIFO: {self._fifo_path}\n"
+              f"  toggle_pause | toggle_correction_window | toggle_head_correction | calibrate\n"
+              f"  smoothing <val> | head_gain <val>", file=sys.stderr)
 
         clock = pygame.time.Clock()
         while not self._stop.is_set():
-            if self.calibration_mode != self._displayed_calibration_mode:
-                if self.calibration_mode:
-                    self._show_calibration_window()
+            if self.correction_window != self._displayed_correction_window:
+                if self.correction_window:
+                    self._show_correction_window()
                 else:
-                    self._hide_calibration_window()
-                self._displayed_calibration_mode = self.calibration_mode
+                    self._hide_correction_window()
+                self._displayed_correction_window = self.correction_window
 
-            if self.calibration_mode:
-                self._handle_calibration_events()
-                self._draw_calibration_frame(font)
+            if self.correction_window:
+                self._handle_correction_events()
+                self._draw_correction_frame(font)
                 clock.tick(60)
             else:
                 pygame.event.pump()  # keep SDL responsive while hidden
@@ -607,10 +707,13 @@ class GazeMouseApp:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Map tobiifreed gaze data to the mouse cursor via uinput, "
-                                             "with an on-demand calibration GUI and optional eye-origin "
-                                             "head-movement correction.")
+                                             "with an on-demand gaze correction window and optional "
+                                             "eye-origin head-movement correction.")
     p.add_argument("--socket", default=default_socket_path(),
                     help="Path to tobiifreed's unix socket (default: $XDG_RUNTIME_DIR/tobiifreed/gaze.sock)")
+    p.add_argument("--fifo", default=default_fifo_path(),
+                    help="Path to the command FIFO (default: $XDG_RUNTIME_DIR/gaze_mouse.fifo). "
+                         "Write newline-terminated commands here to control the app at runtime.")
     p.add_argument("--width", type=int, default=None, help="Screen width in pixels (default: auto-detect via xrandr)")
     p.add_argument("--height", type=int, default=None, help="Screen height in pixels (default: auto-detect via xrandr)")
     p.add_argument("--eye", choices=["left", "right", "both", "either"], default="either",
@@ -635,10 +738,10 @@ def parse_args():
                          f"(default: {DEFAULT_RADIUS}, or whatever is stored in the calib file)")
     p.add_argument("--head-gain", type=float, default=15.0,
                     help="Gain applied to frame-to-frame eye-origin (head) movement when "
-                         "head-movement correction is toggled on via SIGUSR3 (SIGRTMIN); "
-                         "the resulting scaled delta is accumulated into the mouse x/y "
-                         "position each frame. Units depend on tobiifreed's eye-origin "
-                         "coordinate system (often mm) — tune to taste (default: 15.0)")
+                         "head-movement correction is toggled on via the FIFO command "
+                         "'toggle_head_correction'; the resulting scaled delta is accumulated "
+                         "into the mouse x/y position each frame. Units depend on tobiifreed's "
+                         "eye-origin coordinate system (often mm) — tune to taste (default: 15.0)")
     args = p.parse_args()
 
     if args.width is None or args.height is None:
