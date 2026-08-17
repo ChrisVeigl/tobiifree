@@ -226,7 +226,7 @@ export class UsbSource implements Source {
     // build_cal_apply prepends its own [00 00] when applying, so the blob
     // stored/returned must be the raw data WITHOUT that prefix.
     // Keeping the prefix would cause calApply to send [00 00][00 00][data]
-    const blob = rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
+    const blob = rawBlob.length >= 2 ? rawBlob.subarray(2) : rawBlob;
     return blob;
   }
 
