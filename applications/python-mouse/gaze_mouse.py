@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 gaze_mouse.py — drive the mouse cursor from tobiifreed's gaze stream,
-with an on-demand fullscreen gaze correction window and optional eye-origin
-head-movement correction.
+with an on-demand fullscreen gaze correction window and optional
+head assist (eye-origin head-movement compensation).
 
 Connects to the tobiifreed unix socket, subscribes to gaze data, and maps
 the normalized (0..1) gaze coordinates to absolute screen coordinates
@@ -15,12 +15,12 @@ shell interpretation (no redirection or variable expansion needed on the
 hotkey daemon's side):
     gaze-ctl toggle_pause             # pause/resume gaze -> mouse
     gaze-ctl toggle_correction_window # show/hide the gaze correction window
-    gaze-ctl toggle_head_correction   # toggle eye-origin head-movement correction
+    gaze-ctl toggle_head_assist        # toggle head assist (eye-origin head-movement compensation)
     gaze-ctl calibrate                # run the onboard calibration (calibrate.py)
 
 Parameterised commands are also supported:
     gaze-ctl smoothing 0.3   # set EMA smoothing factor
-    gaze-ctl head_gain 20.0  # set head-movement gain
+    gaze-ctl head_gain 20.0  # set head assist gain
 
 The FIFO lives at /run/user/<uid>/gaze_mouse.fifo (i.e. the default
 $XDG_RUNTIME_DIR). Override with --fifo when starting gaze_mouse.py and
@@ -36,15 +36,12 @@ gaze position. Right-click removes the nearest correction point.
 Points are saved to calib_points.json immediately and reloaded automatically
 on the next run.
 
-Eye-origin head-movement correction is a separate, optional layer on top
-of the correction-point gaze correction. While enabled, frame-to-frame
-changes in eye origin position (i.e. how much your head has moved since the
-last sample) are scaled by a gain factor and accumulated into an extra x/y
-offset added to the mapped mouse position. This can help compensate for
-gaze-mapping drift caused by head movement between/during correction
-sessions. Toggling it off and back on resets the accumulated offset and
-re-baselines against the eye origin at the moment it's re-enabled, so there
-is no jump discontinuity.
+Head assist is a separate, optional layer on top of the correction-point
+gaze correction. It compensates for gaze-mapping drift caused by head
+movement: the eye-origin position reported by the tracker is used as a
+head-position proxy, and the offset from a stored baseline is scaled by a
+gain factor and added to the mouse position. Toggling it off and back on
+re-baselines against the current eye origin so there is no jump.
 
 Requires:
     pip install evdev pygame
@@ -128,7 +125,7 @@ GAZE_STRUCT_SIZE = struct.calcsize(GAZE_STRUCT_FMT)  # 392 bytes
 
 VALID = 0   # validity_L/validity_R: 0 == valid, 4 == not detected
 
-HEAD_ASSIST_Y_FACTOR = 2.2  # scale factor for y-axis head correction
+HEAD_ASSIST_Y_FACTOR = 2.2  # scale factor for y-axis head assist offset
 
 # ── Socket path ─────────────────────────────────────────────────────────
 
@@ -244,7 +241,7 @@ class GazeMouseApp:
         self.correction_window = False
         self._displayed_correction_window = False  # whether the gaze correction window is currently shown
 
-        # Eye-origin head-movement correction state (toggled via FIFO command).
+        # Head assist state (toggled via FIFO command toggle_head_assist).
         self.head_assist_enabled = False
         self.head_offset_x = 0.0
         self.head_offset_y = 0.0
@@ -284,7 +281,7 @@ class GazeMouseApp:
         self._gaze_settling = False
         self._settle_anchor_px = None
         self._settle_counter = 0
-        print(f"[gaze_mouse] eye-origin head-movement correction "
+        print(f"[gaze_mouse] head assist "
               f"{'enabled' if self.head_assist_enabled else 'disabled'} (offset reset)",
               file=sys.stderr)
 
@@ -308,7 +305,7 @@ class GazeMouseApp:
             self.correction_window = not self.correction_window
             print(f"[gaze_mouse] gaze correction window "
                   f"{'shown' if self.correction_window else 'hidden'}", file=sys.stderr)
-        elif name == "toggle_head_correction":
+        elif name == "toggle_head_assist":
             self._toggle_head_assist()
         elif name == "smoothing" and arg is not None:
             try:
@@ -478,12 +475,12 @@ class GazeMouseApp:
                 print(f"[gaze_mouse][debug] #{self._debug_count} vL={vL} vR={vR} "
                       f"x={x:.3f} y={y:.3f} valid={valid} paused={self.paused} "
                       f"correction_window={self.correction_window} "
-                      f"head_corr={self.head_assist_enabled} "
+                      f"head_assist={self.head_assist_enabled} "
                       f"origin_L={origin_L} origin_R={origin_R}", file=sys.stderr)
 
         # Publish decoded eye origins for display/debugging (gaze correction
         # window readout and --print-eye-origin), independent of whether
-        # head-movement correction is enabled.
+        # head assist is enabled.
         self.shared.update_origin(origin_L, origin_R, vL, vR)
 
         if self.args.print_eye_origin:
@@ -497,7 +494,7 @@ class GazeMouseApp:
                     file=sys.stderr,
                 )
 
-        # Compute the head-correction offset using an absolute approach: the
+        # Compute the head assist offset using an absolute approach: the
         # offset is always (current_origin - baseline) * gain, never accumulated.
         # Skip the update while settling (gaze jumped recently) — we don't want
         # a blink-corrupted origin to pollute the baseline or the offset.
@@ -529,8 +526,8 @@ class GazeMouseApp:
         raw_py = y * (self.height - 1)
         self.shared.update(raw_px, raw_py, True)
 
-        # Head-correction settling: when the smoothed gaze jumps more than
-        # head_reset_radius pixels, enter a settling state and suspend correction.
+        # Head assist settling: when the smoothed gaze jumps more than
+        # head_reset_radius pixels, suspend head assist and start a settle timer.
         # Re-baseline only once the gaze has been stable within head_settle_radius
         # for head_settle_frames consecutive frames — this avoids capturing a
         # blink-corrupted eye origin as the new baseline.
@@ -546,7 +543,7 @@ class GazeMouseApp:
                 # Enter (or stay in) settling; discard any baseline and offset.
                 if not self._gaze_settling and self.args.debug:
                     print(
-                        f"[gaze_mouse][debug] head-correction: gaze jumped "
+                        f"[gaze_mouse][debug] head assist: gaze jumped "
                         f"{(ddx**2 + ddy**2)**0.5:.1f}px, entering settle",
                         file=sys.stderr,
                     )
@@ -571,7 +568,7 @@ class GazeMouseApp:
                         self.head_offset_y = 0.0
                         if self.args.debug:
                             print(
-                                "[gaze_mouse][debug] head-correction: gaze settled, re-baselined",
+                                "[gaze_mouse][debug] head assist: gaze settled, re-baselined",
                                 file=sys.stderr,
                             )
                 else:
@@ -592,7 +589,7 @@ class GazeMouseApp:
         if self.head_assist_enabled and not self._gaze_settling:
             px += self.head_offset_x
             py -= self.head_offset_y
-            #print(f"[gaze_mouse] head-correction offset applied: "
+            #print(f"[gaze_mouse] head assist offset applied: "
             #      f"({self.head_offset_x:.2f}, {self.head_offset_y:.2f})")
 
         px = int(min(max(px, 0), self.width - 1))
@@ -698,7 +695,7 @@ class GazeMouseApp:
             f"+ / - : adjust radius (currently {int(self.calib.default_radius)}px)",
             "C: clear all correction points",
             f"{len(self.calib.points)} correction point(s) stored",
-            f"Head-movement correction: "
+            f"Head assist: "
             f"{'ON' if self.head_assist_enabled else 'off'} (gain={self.args.head_gain})",
             f"eye_origin_L_mm (v={ovL}): "
             f"({origin_L[0]:.1f}, {origin_L[1]:.1f}, {origin_L[2]:.1f})",
@@ -751,7 +748,7 @@ class GazeMouseApp:
         self._hide_correction_window()
 
         print(f"[gaze_mouse] pid={os.getpid()} — write commands to FIFO: {self._fifo_path}\n"
-              f"  toggle_pause | toggle_correction_window | toggle_head_correction | calibrate\n"
+              f"  toggle_pause | toggle_correction_window | toggle_head_assist | calibrate\n"
               f"  smoothing <val> | head_gain <val> | head_reset_radius <val>", file=sys.stderr)
 
         clock = pygame.time.Clock()
@@ -775,7 +772,7 @@ class GazeMouseApp:
 def parse_args():
     p = argparse.ArgumentParser(description="Map tobiifreed gaze data to the mouse cursor via uinput, "
                                              "with an on-demand gaze correction window and optional "
-                                             "eye-origin head-movement correction.")
+                                             "head assist (eye-origin head-movement compensation).")
     p.add_argument("--socket", default=default_socket_path(),
                     help="Path to tobiifreed's unix socket (default: $XDG_RUNTIME_DIR/tobiifreed/gaze.sock)")
     p.add_argument("--fifo", default=default_fifo_path(),
@@ -804,22 +801,21 @@ def parse_args():
                     help=f"Initial calibration correction radius in pixels "
                          f"(default: {DEFAULT_RADIUS}, or whatever is stored in the calib file)")
     p.add_argument("--head-gain", type=float, default=10.0,
-                    help="Gain applied to frame-to-frame eye-origin (head) movement when "
-                         "head-movement correction is toggled on via the FIFO command "
-                         "'toggle_head_correction'; the resulting scaled delta is accumulated "
-                         "into the mouse x/y position each frame. Tune to taste (default: 10.0)")
+                    help="Gain applied to the eye-origin displacement from baseline when "
+                         "head assist is toggled on via the FIFO command "
+                         "'toggle_head_assist'. Tune to taste (default: 10.0)")
     p.add_argument("--head-reset-radius", type=float, default=100.0,
-                    help="When head-correction is enabled, a gaze jump larger than this many "
-                         "pixels suspends correction and starts the settle timer. "
+                    help="When head assist is enabled, a gaze jump larger than this many "
+                         "pixels suspends head assist and starts the settle timer. "
                          "0 disables the feature. Adjustable at runtime via 'head_reset_radius <val>' "
                          "(default: 100)")
     p.add_argument("--head-settle-radius", type=float, default=40.0,
                     help="Radius in pixels within which the gaze must stay for "
-                         "--head-settle-frames consecutive frames before head-correction "
+                         "--head-settle-frames consecutive frames before head assist "
                          "resumes after a jump (default: 40)")
     p.add_argument("--head-settle-frames", type=int, default=5,
                     help="Number of consecutive frames the gaze must remain within "
-                         "--head-settle-radius before re-baselining head-correction "
+                         "--head-settle-radius before re-baselining head assist "
                          "after a jump (default: 5)")
     args = p.parse_args()
 

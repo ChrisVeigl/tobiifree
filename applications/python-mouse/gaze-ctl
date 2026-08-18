@@ -7,7 +7,7 @@
 # Examples:
 #   gaze-ctl toggle_pause
 #   gaze-ctl toggle_correction_window
-#   gaze-ctl toggle_head_correction
+#   gaze-ctl toggle_head_assist
 #   gaze-ctl smoothing 0.3
 #   gaze-ctl head_gain 20.0
 #
@@ -25,7 +25,7 @@ FIFO="${GAZE_MOUSE_FIFO:-/run/user/$(id -u)/gaze_mouse.fifo}"
 if [ $# -eq 0 ]; then
     echo "Usage: gaze-ctl <command> [arg]" >&2
     echo "Commands: toggle_pause  pause  resume  toggle_correction_window" >&2
-    echo "          toggle_head_correction  calibrate  smoothing <val>  head_gain <val>" >&2
+    echo "          toggle_head_assist  calibrate  smoothing <val>  head_gain <val>" >&2
     exit 1
 fi
 
