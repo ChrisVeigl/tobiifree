@@ -128,6 +128,7 @@ GAZE_STRUCT_SIZE = struct.calcsize(GAZE_STRUCT_FMT)  # 392 bytes
 
 VALID = 0   # validity_L/validity_R: 0 == valid, 4 == not detected
 
+HEAD_CORRECTION_Y_FACTOR = 2.2  # scale factor for y-axis head correction
 
 # ── Socket path ─────────────────────────────────────────────────────────
 
@@ -247,7 +248,14 @@ class GazeMouseApp:
         self.head_correction_enabled = False
         self.head_offset_x = 0.0
         self.head_offset_y = 0.0
-        self._prev_origin_xy = None  # (x, y) of the eye origin last frame, for delta computation
+        self._origin_baseline_xy = None  # eye-origin (x, y) at last enable/reset; offset = (current - baseline) * gain
+        self._prev_smoothed_px = None   # (px, py) of the smoothed gaze last frame, for reset-radius check
+        # Settling state: after a gaze jump the correction is suspended until
+        # the gaze has been stable within head_settle_radius for head_settle_frames
+        # consecutive frames, at which point we re-baseline from a clean origin.
+        self._gaze_settling = False
+        self._settle_anchor_px = None   # position around which we're waiting for stability
+        self._settle_counter = 0        # consecutive frames within the settle radius
         self._last_eye_origin_print = 0.0  # monotonic timestamp, for throttling --print-eye-origin
 
         self.shared = SharedGaze(self.width, self.height)
@@ -267,13 +275,15 @@ class GazeMouseApp:
 
     def _toggle_head_correction(self):
         self.head_correction_enabled = not self.head_correction_enabled
-        # Reset the accumulated offset and the delta baseline every time this
-        # is toggled (on OR off) so re-enabling never produces a jump: the
-        # first frame after toggling just re-establishes the baseline eye
-        # origin rather than applying a stale/large delta.
+        # Clear the baseline, offset, and any pending settling state on every
+        # toggle. When re-enabling, the baseline is established on the first
+        # frame with a valid eye origin so there is no jump discontinuity.
         self.head_offset_x = 0.0
         self.head_offset_y = 0.0
-        self._prev_origin_xy = None
+        self._origin_baseline_xy = None
+        self._gaze_settling = False
+        self._settle_anchor_px = None
+        self._settle_counter = 0
         print(f"[gaze_mouse] eye-origin head-movement correction "
               f"{'enabled' if self.head_correction_enabled else 'disabled'} (offset reset)",
               file=sys.stderr)
@@ -312,6 +322,12 @@ class GazeMouseApp:
                 print(f"[gaze_mouse] head_gain set to {self.args.head_gain}", file=sys.stderr)
             except ValueError:
                 print(f"[gaze_mouse] invalid head_gain value: {arg!r}", file=sys.stderr)
+        elif name == "head_reset_radius" and arg is not None:
+            try:
+                self.args.head_reset_radius = float(arg)
+                print(f"[gaze_mouse] head_reset_radius set to {self.args.head_reset_radius}", file=sys.stderr)
+            except ValueError:
+                print(f"[gaze_mouse] invalid head_reset_radius value: {arg!r}", file=sys.stderr)
         elif name == "calibrate":
             threading.Thread(target=self._launch_calibration, daemon=True).start()
         else:
@@ -481,20 +497,19 @@ class GazeMouseApp:
                     file=sys.stderr,
                 )
 
-        # Update the eye-origin / head-movement tracking regardless of gaze
-        # validity for x/y, as long as at least one eye's origin is valid.
-        # This runs whether or not head correction is currently enabled, so
-        # that re-enabling it doesn't see a huge stale delta (see
-        # _toggle_head_correction, which clears _prev_origin_xy on toggle).
+        # Compute the head-correction offset using an absolute approach: the
+        # offset is always (current_origin - baseline) * gain, never accumulated.
+        # Skip the update while settling (gaze jumped recently) — we don't want
+        # a blink-corrupted origin to pollute the baseline or the offset.
         origin_xy = self._pick_origin_xy(origin_L, origin_R, vL, vR)
-        if origin_xy is not None:
-            if self.head_correction_enabled:
-                if self._prev_origin_xy is not None:
-                    dx = origin_xy[0] - self._prev_origin_xy[0]
-                    dy = origin_xy[1] - self._prev_origin_xy[1]
-                    self.head_offset_x += dx * self.args.head_gain
-                    self.head_offset_y += dy * self.args.head_gain
-            self._prev_origin_xy = origin_xy
+        if origin_xy is not None and self.head_correction_enabled and not self._gaze_settling:
+            if self._origin_baseline_xy is None:
+                # Establish baseline on the first valid origin after enable/reset.
+                self._origin_baseline_xy = origin_xy
+            dx = origin_xy[0] - self._origin_baseline_xy[0]
+            dy = origin_xy[1] - self._origin_baseline_xy[1]
+            self.head_offset_x = dx * self.args.head_gain
+            self.head_offset_y = dy * self.args.head_gain * HEAD_CORRECTION_Y_FACTOR
 
         if not valid:
             self.shared.update(self.shared.raw_x, self.shared.raw_y, False)
@@ -514,6 +529,58 @@ class GazeMouseApp:
         raw_py = y * (self.height - 1)
         self.shared.update(raw_px, raw_py, True)
 
+        # Head-correction settling: when the smoothed gaze jumps more than
+        # head_reset_radius pixels, enter a settling state and suspend correction.
+        # Re-baseline only once the gaze has been stable within head_settle_radius
+        # for head_settle_frames consecutive frames — this avoids capturing a
+        # blink-corrupted eye origin as the new baseline.
+        if self.head_correction_enabled and self.args.head_reset_radius > 0:
+            if self._prev_smoothed_px is not None:
+                ddx = raw_px - self._prev_smoothed_px[0]
+                ddy = raw_py - self._prev_smoothed_px[1]
+                jumped = ddx * ddx + ddy * ddy > self.args.head_reset_radius ** 2
+            else:
+                jumped = False
+
+            if jumped:
+                # Enter (or stay in) settling; discard any baseline and offset.
+                if not self._gaze_settling and self.args.debug:
+                    print(
+                        f"[gaze_mouse][debug] head-correction: gaze jumped "
+                        f"{(ddx**2 + ddy**2)**0.5:.1f}px, entering settle",
+                        file=sys.stderr,
+                    )
+                self._gaze_settling = True
+                self._settle_anchor_px = (raw_px, raw_py)
+                self._settle_counter = 0
+                self._origin_baseline_xy = None
+                self.head_offset_x = 0.0
+                self.head_offset_y = 0.0
+            elif self._gaze_settling:
+                # Gaze didn't jump this frame — check if it's within settle radius.
+                adx = raw_px - self._settle_anchor_px[0]
+                ady = raw_py - self._settle_anchor_px[1]
+                if adx * adx + ady * ady <= self.args.head_settle_radius ** 2:
+                    self._settle_counter += 1
+                    if self._settle_counter >= self.args.head_settle_frames:
+                        # Stable long enough — re-baseline and resume correction.
+                        self._gaze_settling = False
+                        self._settle_counter = 0
+                        self._origin_baseline_xy = origin_xy  # None → set on next valid origin frame
+                        self.head_offset_x = 0.0
+                        self.head_offset_y = 0.0
+                        if self.args.debug:
+                            print(
+                                "[gaze_mouse][debug] head-correction: gaze settled, re-baselined",
+                                file=sys.stderr,
+                            )
+                else:
+                    # Gaze moved away from the settle anchor but didn't jump;
+                    # shift the anchor and reset the counter.
+                    self._settle_anchor_px = (raw_px, raw_py)
+                    self._settle_counter = 0
+        self._prev_smoothed_px = (raw_px, raw_py)
+
         # Gaze correction window bypasses mouse emulation entirely.
         if self.correction_window or self.paused:
             return
@@ -522,7 +589,7 @@ class GazeMouseApp:
         px = raw_px + corr_x
         py = raw_py + corr_y
 
-        if self.head_correction_enabled:
+        if self.head_correction_enabled and not self._gaze_settling:
             px += self.head_offset_x
             py -= self.head_offset_y
             #print(f"[gaze_mouse] head-correction offset applied: "
@@ -685,7 +752,7 @@ class GazeMouseApp:
 
         print(f"[gaze_mouse] pid={os.getpid()} — write commands to FIFO: {self._fifo_path}\n"
               f"  toggle_pause | toggle_correction_window | toggle_head_correction | calibrate\n"
-              f"  smoothing <val> | head_gain <val>", file=sys.stderr)
+              f"  smoothing <val> | head_gain <val> | head_reset_radius <val>", file=sys.stderr)
 
         clock = pygame.time.Clock()
         while not self._stop.is_set():
@@ -718,8 +785,8 @@ def parse_args():
     p.add_argument("--height", type=int, default=None, help="Screen height in pixels (default: auto-detect via xrandr)")
     p.add_argument("--eye", choices=["left", "right", "both", "either"], default="either",
                     help="Which eye's validity to require (default: either)")
-    p.add_argument("--smoothing", type=float, default=0.0,
-                    help="Exponential moving average factor in (0,1]; 0 disables smoothing (default: 0)")
+    p.add_argument("--smoothing", type=float, default=0.5,
+                    help="Exponential moving average factor in (0,1]; 0 disables smoothing (default: 0.5)")
     p.add_argument("--retry-delay", type=float, default=2.0,
                     help="Seconds to wait before reconnecting after a lost connection (default: 2)")
     p.add_argument("--debug", action="store_true",
@@ -736,12 +803,24 @@ def parse_args():
     p.add_argument("--radius", type=float, default=None,
                     help=f"Initial calibration correction radius in pixels "
                          f"(default: {DEFAULT_RADIUS}, or whatever is stored in the calib file)")
-    p.add_argument("--head-gain", type=float, default=15.0,
+    p.add_argument("--head-gain", type=float, default=10.0,
                     help="Gain applied to frame-to-frame eye-origin (head) movement when "
                          "head-movement correction is toggled on via the FIFO command "
                          "'toggle_head_correction'; the resulting scaled delta is accumulated "
-                         "into the mouse x/y position each frame. Units depend on tobiifreed's "
-                         "eye-origin coordinate system (often mm) — tune to taste (default: 15.0)")
+                         "into the mouse x/y position each frame. Tune to taste (default: 10.0)")
+    p.add_argument("--head-reset-radius", type=float, default=100.0,
+                    help="When head-correction is enabled, a gaze jump larger than this many "
+                         "pixels suspends correction and starts the settle timer. "
+                         "0 disables the feature. Adjustable at runtime via 'head_reset_radius <val>' "
+                         "(default: 100)")
+    p.add_argument("--head-settle-radius", type=float, default=40.0,
+                    help="Radius in pixels within which the gaze must stay for "
+                         "--head-settle-frames consecutive frames before head-correction "
+                         "resumes after a jump (default: 40)")
+    p.add_argument("--head-settle-frames", type=int, default=5,
+                    help="Number of consecutive frames the gaze must remain within "
+                         "--head-settle-radius before re-baselining head-correction "
+                         "after a jump (default: 5)")
     args = p.parse_args()
 
     if args.width is None or args.height is None:
