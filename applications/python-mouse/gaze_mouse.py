@@ -337,7 +337,7 @@ class GazeMouseApp:
 
         calibrate_script = (
             pathlib.Path(__file__).resolve().parent.parent
-            / "python-calibrator" / "calibrate.py"
+            / "tobiifree-calibrate" / "calibrate.py"
         )
         if not calibrate_script.exists():
             print(f"[gaze_mouse] calibrate.py not found: {calibrate_script}", file=sys.stderr)

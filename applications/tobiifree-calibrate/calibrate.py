@@ -85,6 +85,13 @@ VALID = 0   # validity_L/validity_R: 0 == valid, 4 == not detected
 
 CALIB_BLOB_PATH = Path("calib_blob.bin")
 
+# The dot radii / font sizes / margins below were tuned for a display with
+# roughly this height in physical pixels. Actual sizes are scaled relative
+# to the real screen height at runtime (see get_ui_scale()) so the UI looks
+# the same physical size regardless of monitor resolution or desktop-level
+# display scaling (e.g. 150% scaling on Linux/Wayland/X11).
+REFERENCE_HEIGHT = 1080
+
 # 5-point calibration grid 
 pts = [
     (0.5, 0.5),
@@ -98,6 +105,39 @@ pts = [
 def get_socket_path():
     runtime_dir = os.environ.get('XDG_RUNTIME_DIR', '/tmp')
     return Path(runtime_dir) / 'tobiifreed' / 'gaze.sock'
+
+
+def get_ui_scale(screen):
+    """
+    Returns a scale factor for UI element sizes (dot radii, fonts, margins),
+    relative to REFERENCE_HEIGHT, based on the actual screen height in
+    pixels. This keeps the calibration UI at a consistent physical size
+    whether running on a small/large monitor or with OS-level display
+    scaling applied.
+    """
+    _, h = screen.get_size()
+    return max(h, 1) / REFERENCE_HEIGHT
+
+
+def create_fullscreen_display():
+    """
+    Creates a fullscreen pygame display, explicitly sized to the current
+    desktop resolution and marked as high-DPI aware.
+
+    On Linux desktops using fractional display scaling (e.g. 150% scaling
+    on GNOME/KDE under Wayland or X11), SDL/pygame can otherwise end up
+    using a 'logical' (scaled) resolution that doesn't match the physical
+    screen, causing the fullscreen window to be mis-sized relative to the
+    real display. Requesting the desktop's own size together with
+    pygame.SCALED makes SDL treat the window as high-DPI aware, so the
+    calibration dots and gaze dot line up correctly with the physical
+    screen regardless of the configured scaling factor.
+    """
+    desktop_sizes = pygame.display.get_desktop_sizes()
+    if desktop_sizes:
+        size = desktop_sizes[0]
+        return pygame.display.set_mode(size, pygame.FULLSCREEN | pygame.SCALED)
+    return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 
 
 def encode_header(msg_type, payload_len):
@@ -254,6 +294,27 @@ class DaemonConnection:
             pass
 
 
+def request_with_retries(conn, cmd_type, payload=b'', timeout=30.0, max_attempts=5, retry_delay=0.5):
+    """
+    Like DaemonConnection.request(), but retries on failure (RuntimeError from
+    an SRV_ERR response, or TimeoutError from no response at all) up to
+    `max_attempts` times before giving up.
+
+    This works around an intermittent issue where the daemon occasionally
+    fails to acknowledge a command (e.g. "cal_start: no response").
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return conn.request(cmd_type, payload, timeout=timeout)
+        except (RuntimeError, TimeoutError) as exc:
+            last_exc = exc
+            print(f"Command 0x{cmd_type:02x} failed (attempt {attempt}/{max_attempts}): {exc}")
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+    raise last_exc
+
+
 def run_calibration(conn, screen, font, big_font):
     """
     Runs a single 5-point calibration sequence.
@@ -261,12 +322,15 @@ def run_calibration(conn, screen, font, big_font):
     cancelled by pressing ESC.
     """
     w, h = screen.get_size()
+    ui_scale = get_ui_scale(screen)
+    dot_radius = max(1, round(15 * ui_scale))
+    bottom_margin = round(100 * ui_scale)
 
     current_idx = 0
     capturing = False
 
     print("Starting calibration...")
-    conn.request(CMD_START_CALIBRATION)
+    request_with_retries(conn, CMD_START_CALIBRATION)
 
     def draw_state():
         screen.fill((0, 0, 0))
@@ -275,14 +339,14 @@ def run_calibration(conn, screen, font, big_font):
             px, py = int(x_norm * w), int(y_norm * h)
 
             color = (255, 255, 0) if capturing else (0, 255, 0)
-            pygame.draw.circle(screen, color, (px, py), 15)
+            pygame.draw.circle(screen, color, (px, py), dot_radius)
 
             msg = f"Point {current_idx + 1}/{len(pts)}: Look at the dot and press ENTER. (Esc to cancel)"
             if capturing:
                 msg = f"Capturing point {current_idx + 1}... hold your gaze!"
 
             text_surf = font.render(msg, True, (255, 255, 255))
-            screen.blit(text_surf, (w // 2 - text_surf.get_width() // 2, h - 100))
+            screen.blit(text_surf, (w // 2 - text_surf.get_width() // 2, h - bottom_margin))
         else:
             msg = "Computing calibration..."
             text_surf = big_font.render(msg, True, (255, 255, 255))
@@ -339,6 +403,12 @@ def run_live_view(conn, screen, font):
     pressed ESC / closed the window.
     """
     w, h = screen.get_size()
+    ui_scale = get_ui_scale(screen)
+    marker_radius = max(1, round(5 * ui_scale))
+    gaze_radius = max(1, round(18 * ui_scale))
+    gaze_ring_width = max(1, round(2 * ui_scale))
+    line_bottom_margin = round(60 * ui_scale)
+    line_spacing = round(26 * ui_scale)
 
     while True:
         screen.fill((0, 0, 0))
@@ -346,13 +416,13 @@ def run_live_view(conn, screen, font):
         # Draw calibration points first so they remain in the background.
         for x_norm, y_norm in pts:
             px, py = int(x_norm * w), int(y_norm * h)
-            pygame.draw.circle(screen, (100, 100, 100), (px, py), 5)
+            pygame.draw.circle(screen, (100, 100, 100), (px, py), marker_radius)
 
         x_norm, y_norm, valid = conn.gaze.get()
         if valid:
             px, py = int(x_norm * w), int(y_norm * h)
-            pygame.draw.circle(screen, (0, 200, 255), (px, py), 18)
-            pygame.draw.circle(screen, (255, 255, 255), (px, py), 18, width=2)
+            pygame.draw.circle(screen, (0, 200, 255), (px, py), gaze_radius)
+            pygame.draw.circle(screen, (255, 255, 255), (px, py), gaze_radius, width=gaze_ring_width)
         else:
             msg = "waiting for valid gaze data..."
             text_surf = font.render(msg, True, (200, 60, 60))
@@ -363,7 +433,7 @@ def run_live_view(conn, screen, font):
         ]
         for i, line in enumerate(lines):
             text_surf = font.render(line, True, (255, 255, 255))
-            screen.blit(text_surf, (w // 2 - text_surf.get_width() // 2, h - 60 + i * 26))
+            screen.blit(text_surf, (w // 2 - text_surf.get_width() // 2, h - line_bottom_margin + i * line_spacing))
 
         pygame.display.flip()
 
@@ -430,11 +500,12 @@ def main():
         print("Continuing without live gaze feedback where possible.")
 
     pygame.init()
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    screen = create_fullscreen_display()
     pygame.mouse.set_visible(False)
 
-    font = pygame.font.Font(None, 36)
-    big_font = pygame.font.Font(None, 48)
+    ui_scale = get_ui_scale(screen)
+    font = pygame.font.Font(None, max(1, round(36 * ui_scale)))
+    big_font = pygame.font.Font(None, max(1, round(48 * ui_scale)))
 
     try:
         blob = None

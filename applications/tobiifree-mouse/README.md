@@ -54,3 +54,24 @@ If you have set up the `uinput` permissions correctly:
 *   The mouse cursor should jump to wherever you look.
 *   Maintain your gaze steadily for ~1 second to trigger a click.
 *   (Check `src/main.zig` to change the hardcoded screen resolution if needed)
+
+## Command-line Options
+
+```shell
+./zig-out/bin/tobiifree-mouse [options]
+```
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--click` | Enable dwell clicking (disabled by default; without it the cursor moves but never clicks) | disabled |
+| `--click-radius <float>` | Normalized radius (0.0–1.0, relative to screen size) the gaze must stay within to count as a dwell | `0.05` |
+| `--click-dwell-ms <int>` | Time in milliseconds the gaze must remain within the radius before a click is emitted | `1000` |
+| `--help`, `-h` | Print usage and exit | — |
+
+Example, enabling dwell clicking with a larger radius and a shorter dwell time:
+
+```shell
+./zig-out/bin/tobiifree-mouse --click --click-radius 0.08 --click-dwell-ms 700
+```
+
+Unknown arguments are logged as a warning and otherwise ignored.
