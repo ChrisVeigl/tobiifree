@@ -307,7 +307,7 @@ pub const Tracker = struct {
     }
 
     fn driveStateMachine(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8) bool {
-        return self.driveStateMachineMs(poll_fn, label, 15_000);
+        return self.driveStateMachineMs(poll_fn, label, 150_000);
     }
 
     fn driveStateMachineMs(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8, timeout_ms: i64) bool {
@@ -318,25 +318,26 @@ pub const Tracker = struct {
             switch (action) {
                 .send => {
                     const len = core.session_out_len_();
-                    log.debug("{s} step {d}: send {d} bytes", .{ label, max_steps, len });
+                    log.debug("{s} step {d}: send {d} bytes", .{ label, steps, len });
                     if (len > 0) {
                         if (!self.send_fn(core.session_out_ptr()[0..len])) {
-                            log.err("{s}: send failed at step {d}", .{ label, max_steps });
+                            log.err("{s}: send failed at step {d}", .{ label, steps });
                             return false;
                         }
                     }
                     self.drainReads(10);
                 },
                 .recv => {
-                    log.debug("{s} step {d}: recv", .{ label, max_steps });
+                    // Only log intermittently to avoid spam
+                    if (steps % 100 == 0) log.debug("{s} step {d}: recv", .{ label, steps });
                     self.drainReads(5);
                 },
                 .done => {
-                    log.info("{s} complete in {d} steps", .{ label, max_steps });
+                    log.info("{s} complete in {d} steps", .{ label, steps });
                     return true;
                 },
                 .err => {
-                    log.err("{s} failed at step {d}", .{ label, max_steps });
+                    log.err("{s} failed at step {d}", .{ label, steps });
                     return false;
                 },
             }
