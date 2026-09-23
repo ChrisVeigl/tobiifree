@@ -26,15 +26,20 @@ pub const Tracker = struct {
     connected: bool,
     gaze_cb: ?GazeFn,
     display: DisplayCorners,
-    /// When true, poll() returns immediately so that the main thread owns all
-    /// USB reads during calibration state machines. This prevents concurrent
-    /// feed_usb_in calls (and the integer overflow they cause) without a mutex
-    /// that would deadlock because poll() holds a lock during a blocking read.
-    calibrating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Tracks which side owns the transport, so poll() and the calibration state
+    /// machines never call recv_fn/feed_usb_in concurrently (which would corrupt
+    /// the core parser). A plain bool + fixed sleep isn't enough here: recv_fn can
+    /// block for up to ~100ms, so the transition to `.calibrating` is done with a
+    /// CAS loop that only succeeds once poll() has observed `.idle` and is not
+    /// mid-read. A mutex is avoided because poll() would hold it across a
+    /// blocking read, which can deadlock.
+    usb_owner: std.atomic.Value(UsbOwner) = std.atomic.Value(UsbOwner).init(.idle),
 
     pub const SendFn = *const fn (data: []const u8) bool;
     pub const RecvFn = *const fn (buf: []u8) ?usize;
     pub const GazeFn = *const fn (*const core.GazeSample) void;
+
+    pub const UsbOwner = enum(u8) { idle, busy, calibrating };
 
     /// Three-corner display area as reported by the device.
     pub const DisplayCorners = struct {
@@ -151,11 +156,12 @@ pub const Tracker = struct {
 
     /// Poll for USB data. First read blocks until data arrives (device-paced).
     /// Subsequent reads are non-blocking to drain any buffered packets.
-    /// Returns immediately (no reads) while a calibration state machine is running
-    /// so that the main thread owns all USB I/O exclusively.
+    /// Returns immediately (no reads) while a calibration state machine owns
+    /// (or is claiming) the transport, so the main thread has USB I/O exclusively.
     pub fn poll(self: *Tracker) void {
         if (!self.connected) return;
-        if (self.calibrating.load(.acquire)) return;
+        if (self.usb_owner.cmpxchgStrong(.idle, .busy, .acquire, .monotonic) != null) return;
+        defer self.usb_owner.store(.idle, .release);
         active = self;
 
         var buf: [16384]u8 = undefined;
@@ -232,12 +238,22 @@ pub const Tracker = struct {
 
     // ── Calibration ─────────────────────────────────────────────────
 
+    /// Wait for poll() to be outside (or not about to enter) a read, then claim
+    /// the transport exclusively. Loops rather than sleeping a fixed duration
+    /// because recv_fn's blocking read can take arbitrarily long.
+    fn beginCalibrating(self: *Tracker) void {
+        while (self.usb_owner.cmpxchgWeak(.idle, .calibrating, .acquire, .monotonic) != null) {
+            std.Thread.sleep(1_000_000); // 1 ms
+        }
+    }
+
+    fn endCalibrating(self: *Tracker) void {
+        self.usb_owner.store(.idle, .release);
+    }
+
     pub fn startCalibration(self: *Tracker) bool {
-        self.calibrating.store(true, .release);
-        defer self.calibrating.store(false, .release);
-        // Give the USB thread time to finish any in-flight blocking read before
-        // the main thread starts issuing its own reads via drainReads.
-        std.Thread.sleep(30_000_000); // 30 ms
+        self.beginCalibrating();
+        defer self.endCalibrating();
         // Step 1: unlock the calibration realm.
         core.cal_start_init();
         if (!self.driveStateMachine(&core.cal_start_poll, "cal_realm")) return false;
@@ -254,15 +270,15 @@ pub const Tracker = struct {
     }
 
     pub fn finishCalibration(self: *Tracker) bool {
-        self.calibrating.store(true, .release);
-        defer self.calibrating.store(false, .release);
+        self.beginCalibrating();
+        defer self.endCalibrating();
         core.cal_finish_init();
         return self.driveStateMachine(&core.cal_finish_poll, "cal_finish");
     }
 
     pub fn calApply(self: *Tracker, blob: []const u8) bool {
-        self.calibrating.store(true, .release);
-        defer self.calibrating.store(false, .release);
+        self.beginCalibrating();
+        defer self.endCalibrating();
         const scratch = core.scratch_ptr();
         @memcpy(scratch[0..blob.len], blob);
         core.cal_apply_init(@intCast(blob.len));
