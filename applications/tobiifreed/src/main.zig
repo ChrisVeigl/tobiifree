@@ -267,10 +267,14 @@ fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, pa
         return;
     }
     if (is_ws) {
-        // WS framing requires a contiguous buffer. Calibration blobs are not
-        // expected over WebSocket; log and skip rather than stack-overflow.
+        // WS framing requires a contiguous buffer. Calibration blobs are too
+        // large to fit; reply with an explicit error so the client doesn't
+        // hang waiting for a response that will never arrive.
         if (payload.len > 8192) {
-            log.warn("sendResult: WS payload too large ({} bytes), skipping", .{payload.len});
+            log.warn("sendResult: WS payload too large ({} bytes), sending error", .{payload.len});
+            var err_buf: [proto.HEADER_SIZE + 4]u8 = undefined;
+            proto.encodeError(&err_buf, 0x02);
+            if (ws) |*w| w.sendToClient(client_fd, &err_buf);
             return;
         }
         var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
