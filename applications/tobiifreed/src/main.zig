@@ -271,8 +271,8 @@ fn buildRequest(cmd: proto.Cmd, payload: []const u8) ?u32 {
 
 fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, payload: []const u8) void {
     if (!ok) {
-        var err_buf: [proto.HEADER_SIZE + 4]u8 = undefined;
-        proto.encodeError(&err_buf, 0x01);
+        var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
+        proto.encodeError(&err_buf, cmd_type, 0x01);
         if (is_ws) {
             if (ws) |*w| w.sendToClient(client_fd, &err_buf);
         } else {
@@ -286,8 +286,8 @@ fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, pa
         // hang waiting for a response that will never arrive.
         if (payload.len > WS_MAX_RESPONSE_PAYLOAD) {
             log.warn("sendResult: WS payload too large ({} bytes), sending error", .{payload.len});
-            var err_buf: [proto.HEADER_SIZE + 4]u8 = undefined;
-            proto.encodeError(&err_buf, 0x02);
+            var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
+            proto.encodeError(&err_buf, cmd_type, 0x02);
             if (ws) |*w| w.sendToClient(client_fd, &err_buf);
             return;
         }
