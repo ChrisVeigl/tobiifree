@@ -231,20 +231,6 @@ export class UsbSource implements Source {
     return blob;
   }
 
-  /** Read the calibration blob without recomputing it. */
-  async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
-    this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
-    const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
-    if (this.core.hadTruncation()) {
-      throw new Error(
-        `calibration blob was truncated to the wasm buffer (got ${rawBlob.byteLength} bytes) — ` +
-        'do not apply it; raise CAL_BLOB_MAX');
-    }
-    // Strip the 2-byte status prefix, same as finishCalibration() — calApply
-    // prepends its own prefix, so a stored/returned blob must not include one.
-    return rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
-  }
-
   async calApply(blob: Uint8Array): Promise<void> {
     log('calApply', blob.byteLength, 'bytes');
     this.core.writeScratch(blob);
@@ -267,6 +253,26 @@ export class UsbSource implements Source {
   }
 
   // ── UsbSource-only extras ─────────────────────────────────────────
+
+  /**
+   * Read the calibration blob without recomputing it.
+   *
+   * Not part of the `Source` interface: the daemon protocol has no
+   * cal_retrieve command, so `WsSource` cannot implement this. Only call it
+   * on a concrete `UsbSource`.
+   */
+  async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
+    this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
+    const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
+    if (this.core.hadTruncation()) {
+      throw new Error(
+        `calibration blob was truncated to the wasm buffer (got ${rawBlob.byteLength} bytes) — ` +
+        'do not apply it; raise CAL_BLOB_MAX');
+    }
+    // Strip the 2-byte status prefix, same as finishCalibration() — calApply
+    // prepends its own prefix, so a stored/returned blob must not include one.
+    return rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
+  }
 
   /** Raw-column gaze listener (wasm-only, not part of Source interface). */
   subscribeToRawGaze(listener: (cols: RawGazeColumn[]) => void): Unsubscribe {
