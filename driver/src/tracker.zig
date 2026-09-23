@@ -34,6 +34,10 @@ pub const Tracker = struct {
     /// mid-read. A mutex is avoided because poll() would hold it across a
     /// blocking read, which can deadlock.
     usb_owner: std.atomic.Value(UsbOwner) = std.atomic.Value(UsbOwner).init(.idle),
+    /// Set while a calibration section wants the transport. poll() checks this
+    /// before even attempting the idle->busy CAS, so the USB thread stops
+    /// re-claiming ownership;
+    cal_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const SendFn = *const fn (data: []const u8) bool;
     pub const RecvFn = *const fn (buf: []u8) ?usize;
@@ -160,6 +164,7 @@ pub const Tracker = struct {
     /// (or is claiming) the transport, so the main thread has USB I/O exclusively.
     pub fn poll(self: *Tracker) void {
         if (!self.connected) return;
+        if (self.cal_pending.load(.acquire)) return;
         if (self.usb_owner.cmpxchgStrong(.idle, .busy, .acquire, .monotonic) != null) return;
         defer self.usb_owner.store(.idle, .release);
         active = self;
@@ -242,6 +247,8 @@ pub const Tracker = struct {
     /// the transport exclusively. Loops rather than sleeping a fixed duration
     /// because recv_fn's blocking read can take arbitrarily long.
     fn beginCalibrating(self: *Tracker) void {
+        // Tell poll() to stop contending for ownership; 
+        self.cal_pending.store(true, .release);
         while (self.usb_owner.cmpxchgWeak(.idle, .calibrating, .acquire, .monotonic) != null) {
             std.Thread.sleep(1_000_000); // 1 ms
         }
@@ -249,6 +256,7 @@ pub const Tracker = struct {
 
     fn endCalibrating(self: *Tracker) void {
         self.usb_owner.store(.idle, .release);
+        self.cal_pending.store(false, .release);
     }
 
     pub fn startCalibration(self: *Tracker) bool {
