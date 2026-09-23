@@ -234,7 +234,15 @@ export class UsbSource implements Source {
   /** Read the calibration blob without recomputing it. */
   async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
     this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
-    return this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
+    const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
+    if (this.core.hadTruncation()) {
+      throw new Error(
+        `calibration blob was truncated to the wasm buffer (got ${rawBlob.byteLength} bytes) — ` +
+        'do not apply it; raise CAL_BLOB_MAX');
+    }
+    // Strip the 2-byte status prefix, same as finishCalibration() — calApply
+    // prepends its own prefix, so a stored/returned blob must not include one.
+    return rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
   }
 
   async calApply(blob: Uint8Array): Promise<void> {
