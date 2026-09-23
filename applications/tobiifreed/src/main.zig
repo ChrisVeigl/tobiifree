@@ -24,6 +24,11 @@ const CONFIG_PATH = ".config/tobii.json";
 
 const proto = @import("daemon_protocol");
 
+// WsServer.sendToClient frames data into a fixed `[4 + 8192]u8` buffer, and the
+// data it receives is `HEADER_SIZE + 1 (cmd_type) + payload`. Bound payloads
+// sent over WS accordingly so encodeWsFrame never writes past that buffer.
+const WS_MAX_RESPONSE_PAYLOAD = 8192 - proto.HEADER_SIZE - 1;
+
 // ── State ───────────────────────────────────────────────────────────
 
 var transport: LibusbTransport = undefined;
@@ -132,6 +137,11 @@ fn onResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void 
     };
 
     const payload = payload_ptr[0..payload_len];
+    const max_payload: usize = if (entry.is_ws) WS_MAX_RESPONSE_PAYLOAD else 8192;
+    if (payload.len > max_payload) {
+        log.warn("onResponse: payload too large ({} bytes) for fd={}, dropping", .{ payload.len, entry.client_fd });
+        return;
+    }
     var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
     const msg_len = proto.encodeResponse(&buf, entry.cmd_type, payload);
 
@@ -270,7 +280,7 @@ fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, pa
         // WS framing requires a contiguous buffer. Calibration blobs are too
         // large to fit; reply with an explicit error so the client doesn't
         // hang waiting for a response that will never arrive.
-        if (payload.len > 8192) {
+        if (payload.len > WS_MAX_RESPONSE_PAYLOAD) {
             log.warn("sendResult: WS payload too large ({} bytes), sending error", .{payload.len});
             var err_buf: [proto.HEADER_SIZE + 4]u8 = undefined;
             proto.encodeError(&err_buf, 0x02);
