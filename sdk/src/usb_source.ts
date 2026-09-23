@@ -213,6 +213,7 @@ export class UsbSource implements Source {
    */
   async finishCalibration(): Promise<Uint8Array> {
     log('finishCalibration');
+    this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
     await this.calRequest(() => this.core.requestCalPointsApply(), 120_000);
     await this.calRequest(() => this.core.requestCalStop());
     const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), 60_000);
@@ -232,6 +233,7 @@ export class UsbSource implements Source {
 
   /** Read the calibration blob without recomputing it. */
   async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
+    this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
     return this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
   }
 
