@@ -167,7 +167,11 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
             if (err == error.WouldBlock) {
                 // Buffer full — wait until the fd is writable (up to 5 s).
                 var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-                _ = std.posix.poll(&pfd, 5000) catch return;
+                const nready = std.posix.poll(&pfd, 5000) catch return;
+                // Timeout, or error/hangup on the fd — give up instead of spinning forever.
+                if (nready == 0) return;
+                const bad = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
+                if (pfd[0].revents & bad != 0) return;
                 continue;
             }
             return; // real error (EPIPE, EBADF, …) — give up
