@@ -279,6 +279,7 @@ pub const Tracker = struct {
     pub fn calApply(self: *Tracker, blob: []const u8) bool {
         self.beginCalibrating();
         defer self.endCalibrating();
+        if (blob.len > core.scratch_size()) return false;
         const scratch = core.scratch_ptr();
         @memcpy(scratch[0..blob.len], blob);
         core.cal_apply_init(@intCast(blob.len));
