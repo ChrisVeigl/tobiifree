@@ -142,7 +142,7 @@ fn emitSync(fd: i32) !void {
 // removed duplicate handler and global variable
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     // Register SIGUSR1 signal handler for toggling pause

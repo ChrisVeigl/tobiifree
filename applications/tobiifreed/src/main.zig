@@ -24,6 +24,11 @@ const CONFIG_PATH = ".config/tobii.json";
 
 const proto = @import("daemon_protocol");
 
+// WsServer.sendToClient frames data into a fixed `[4 + 8192]u8` buffer, and the
+// data it receives is `HEADER_SIZE + 1 (cmd_type) + payload`. Bound payloads
+// sent over WS accordingly so encodeWsFrame never writes past that buffer.
+const WS_MAX_RESPONSE_PAYLOAD = 8192 - proto.HEADER_SIZE - 1;
+
 // ── State ───────────────────────────────────────────────────────────
 
 var transport: LibusbTransport = undefined;
@@ -132,6 +137,11 @@ fn onResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void 
     };
 
     const payload = payload_ptr[0..payload_len];
+    const max_payload: usize = if (entry.is_ws) WS_MAX_RESPONSE_PAYLOAD else 8192;
+    if (payload.len > max_payload) {
+        log.warn("onResponse: payload too large ({} bytes) for fd={}, dropping", .{ payload.len, entry.client_fd });
+        return;
+    }
     var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
     const msg_len = proto.encodeResponse(&buf, entry.cmd_type, payload);
 
@@ -157,7 +167,11 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
             if (err == error.WouldBlock) {
                 // Buffer full — wait until the fd is writable (up to 5 s).
                 var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-                _ = std.posix.poll(&pfd, 5000) catch return;
+                const nready = std.posix.poll(&pfd, 5000) catch return;
+                // Timeout, or error/hangup on the fd — give up instead of spinning forever.
+                if (nready == 0) return;
+                const bad = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
+                if (pfd[0].revents & bad != 0) return;
                 continue;
             }
             return; // real error (EPIPE, EBADF, …) — give up
@@ -257,8 +271,8 @@ fn buildRequest(cmd: proto.Cmd, payload: []const u8) ?u32 {
 
 fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, payload: []const u8) void {
     if (!ok) {
-        var err_buf: [proto.HEADER_SIZE + 4]u8 = undefined;
-        proto.encodeError(&err_buf, 0x01);
+        var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
+        proto.encodeError(&err_buf, cmd_type, 0x01);
         if (is_ws) {
             if (ws) |*w| w.sendToClient(client_fd, &err_buf);
         } else {
@@ -267,10 +281,14 @@ fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, pa
         return;
     }
     if (is_ws) {
-        // WS framing requires a contiguous buffer. Calibration blobs are not
-        // expected over WebSocket; log and skip rather than stack-overflow.
-        if (payload.len > 8192) {
-            log.warn("sendResult: WS payload too large ({} bytes), skipping", .{payload.len});
+        // WS framing requires a contiguous buffer. Calibration blobs are too
+        // large to fit; reply with an explicit error so the client doesn't
+        // hang waiting for a response that will never arrive.
+        if (payload.len > WS_MAX_RESPONSE_PAYLOAD) {
+            log.warn("sendResult: WS payload too large ({} bytes), sending error", .{payload.len});
+            var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
+            proto.encodeError(&err_buf, cmd_type, 0x02);
+            if (ws) |*w| w.sendToClient(client_fd, &err_buf);
             return;
         }
         var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
