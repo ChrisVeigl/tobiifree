@@ -1,147 +1,58 @@
+# Notes about setup and calibration  
 
+with tobiifree in native or web use; see original repo: https://github.com/Aetherall/tobiifree
 
-# Notes and first steps 
+## Calibration file location and format
 
-with tobiifree see original repo: https://github.com/Aetherall/tobiifree
+When using the gaze tracker natively under Linux via the `tobiifreed` daemon, a settings file is expected in the folder `~/.config/tobii.json`.
 
-## calibration file location and format
+### Format of tobii.json
 
-I supposed that the calibration file is expected in ~/.config/tobii.json
-So first i copied the content of the provided calibration file (./calibrations/manual-2026-04-06.json) to ~/.config/tobii.json
-but tobiifree-overlay seems to use a different format, e.g. defining the physical screen size in millimeters using w_mm / h_mm ?
-I am now using this tobii.json for my laptop screen (sized 30 x 19 cm) but i needed to manually tweak values for cx, cy, z_mm and tilt, 
-using some unintuitive values for cy an cx (as the tracker is centered on the lower edge of my laptop screen) - so i might be doing something wrong
+A typical `tobii.json` looks like:
 
-
-```
+```json
 {
   "display_area": {
     "w_mm": 300,
     "h_mm": 190,
-    "cx": -30,
-    "cy": -140,
-    "z_mm": 50,
+    "cx":  0,
+    "cy":  -100,
+    "z_mm": 0,
     "tilt": 0
   }
 }
 ```
 
-Question is why the exact screen dimension in mm is needed (given that this does not have to be specified in the Tobii Windows driver/SDK)
- - and if we could provide a calibration method that is accessible for people who cannot edit files or deal with complex settings / small UI elements ...
+**Interpretation:**
 
-The calibration workbench the fork by georgy-wyy (https://github.com/george-wyy/tobiifree) provides an additional layer for gaze data correction 
-(client-side, using affine or poly transformation on top of the on-device calibration) - this is an interesting approach, but still we need to make on-device-calibration made easier / accessible (see below).
+- `w_mm`, `h_mm` – visible panel size dimension in mm. Could be measured using a ruler etc. directly from the screen.
+- `cx`, `cy` – tracker position relative to the screen centre in mm (x right, y up). Anchor expressions work too:
+  `cx`: `l` / `c` / `r`, `cy`: `t` / `c` / `b`, each with `+/- offset`; e.g. `"cy": "b - 10"` = 10 mm below the bottom edge.
+- `z_mm` – plane depth (tracker position in z-direction in mm, negative: towards the user, positive: away from the user)
+- `tilt` – degrees (0 = flush, negative: screen top tilted toward the user, positive: screen top tilted away from the user).
 
+Please note that this interpretation of coordinates is differnt from the tobiifree web demo slider positions. Also, the content of the provided calibration file (`./calibrations/manual-2026-04-06.json`) represents manually tweaked settings for the web demo, and differs from the values in `~/.config/tobii.json`.
 
-## Calibration procedure(s)
+## Calibration procedure
 
-I am still unsure how to calibrate the system correctly (e.g. to a new user). 
-I noticed the different calibration variants in the web demo, but I am not sure in which way they differ and how to use them correcty
-(the goal would be to avoid manual tweaking of the tobii.json config file, and just trigger the calibration procedure for a (new) user, same as with the original Tobii driver.)
+Usually, the calibration flow is:
+* measure the screen size and tracker location, and provide the data (in tobii.json for native/daemon use or via the Web SDK). The [tobiifree web demo](https://aetherall.github.io/tobiifree/) presents slides to adjust these parameters. Another strategy is a simple user dialog where screen size can be entered, such as in [gazeGrid demo](https://github.com/ChrisVeigl/gazeGrid). The screen size and tracker locations have to be provided only once, as they are stored pesistently in the .json file (for daemon) or in the browser cache (for web applications)  
+* perform an on-device calibration (e.g. 5-point or 9-point calibration) and store the calibration blob (usually done automatically ba the calibration tool).
+* a python calibration script for native use via tobiifreed is provided: `[tobiifree-calibrate](https://github.com/ChrisVeigl/tobiifree/tree/main/applications/tobiifree-calibrate). The calibration blob file is stored in the same folder. If a blob filename is given as a commandline argument, the stored calibration blob is applied.
+* apply a recently stored calibration blob after the tracker is re-attached or a user profile shall be switched 
 
-* the sliders are helpful for screen size / orientation adjustments - but I do not understand in which way this could generate a tobii.json file with display area settings that are actually useful for local application (so that tobiifreed uses these settings)? 
-* do the slider settings actually make a difference for the calibration parameters which are stored to the tobii tracker - or are these just relevant for the web GUI display?
-* is it sufficient to run the (5- or 9-point) on-device-calibration to get persistent calibration on the device? It seems that cal_apply is not called after the calibration is finished when used from the web demo .. and there is no button for cal_apply ..
-* I made a python calibration script which follows the procedure outlined in the SDK - it connects to tobiifreed, which logs the following messages during the calibration process:
+## Additional (SW-based) calibration layers
+The calibration workbench in the fork by georgy-wyy (https://github.com/george-wyy/tobiifree) provides an additional layer for gaze data correction (client-side, using affine or poly transformation on top of the on-device calibration) - this is an interesting approach to improve sitations where the on-device calibration yields insufficient quality especially in certain screen regions 
 
-```
-info(server): client connected (total: 1)
-debug(tracker): cal_start step 0: send 34 bytes
-debug(tracker): cal_start step 1: send 44 bytes
-info(tracker): cal_start complete in 2 steps
-debug(tobiifreed): forwarded cmd=0x21 request_id=7 for fd=11
-debug(tobiifreed): routed response for cmd=0x21 to fd=11
-debug(tobiifreed): forwarded cmd=0x21 request_id=8 for fd=11
-debug(tobiifreed): routed response for cmd=0x21 to fd=11
-debug(tobiifreed): forwarded cmd=0x21 request_id=9 for fd=11
-debug(tobiifreed): routed response for cmd=0x21 to fd=11
-debug(tobiifreed): forwarded cmd=0x21 request_id=10 for fd=11
-debug(tobiifreed): routed response for cmd=0x21 to fd=11
-debug(tobiifreed): forwarded cmd=0x21 request_id=11 for fd=11
-debug(tobiifreed): routed response for cmd=0x21 to fd=11
-debug(tracker): cal_finish step 0: send 34 bytes
-debug(tracker): cal_finish step 1: send 34 bytes
-debug(tracker): cal_finish step 2: send 43 bytes
-info(tracker): cal_finish complete in 3 steps
-debug(tracker): cal_apply step 0: send 34 bytes
-debug(tracker): cal_apply step 1: send 44 bytes
-debug(tracker): cal_apply step 2: send 1514 bytes
-debug(tracker): cal_apply step 3: send 43 bytes
-info(tracker): cal_apply complete in 4 steps
-debug(tobiifreed): gaze #500: vL=0 vR=4 x=1.048 y=-0.127
-info(server): client disconnected (total: 0)
-```
+## Mouse emulation with tobiifree-mouse
 
-Although this looks correct (cal_apply is sent after cal_finish, including the obtained calibration blob) there is no visible effect of the calibration after it was done (same gaze coordinates, even if i look at wrong locations during calibration ...)
- 
+The native mouse emulation client [gaze_mouse](https://github.com/ChrisVeigl/tobiifree/tree/main/applications/python-mouse) sets the mouse cursor to the current gaze location via `uinput` and provides optional dwell clicking. It also features client-side calibration and a "head-assist mode" where gaze position can be corrected via small head movements. Additionally, offset correction points can be added on-demand (see README).  
 
-## Mouse emulation
-
-I added a mouse emulation client (tobiifree-mouse) which sets the mouse cursor to the current gaze location and provides optional dwell clicking.
-It also features client-side calibration and gaze position correction, using a built in calibration GUI and offset correction points which can be added on-demand.
-
-
-```
-usage: gaze_mouse.py [-h] [--socket SOCKET] [--width WIDTH] [--height HEIGHT] [--eye {left,right,both,either}] [--smoothing SMOOTHING]
-                     [--retry-delay RETRY_DELAY] [--debug] [--print-eye-origin] [--print-eye-origin-rate PRINT_EYE_ORIGIN_RATE]
-                     [--calib-file CALIB_FILE] [--radius RADIUS] [--head-gain HEAD_GAIN]
-
-Map tobiifreed gaze data to the mouse cursor via uinput, with an on-demand calibration GUI and optional eye-origin head-movement
-correction.
-
-options:
-  -h, --help            show this help message and exit
-  --socket SOCKET       Path to tobiifreed's unix socket (default: $XDG_RUNTIME_DIR/tobiifreed/gaze.sock)
-  --width WIDTH         Screen width in pixels (default: auto-detect via xrandr)
-  --height HEIGHT       Screen height in pixels (default: auto-detect via xrandr)
-  --eye {left,right,both,either}
-                        Which eye's validity to require (default: either)
-  --smoothing SMOOTHING
-                        Exponential moving average factor in (0,1]; 0 disables smoothing (default: 0)
-  --retry-delay RETRY_DELAY
-                        Seconds to wait before reconnecting after a lost connection (default: 2)
-  --debug               Print raw/parsed gaze samples and non-gaze messages to stderr
-  --print-eye-origin    Continuously print the decoded left/right eye origin (eye_origin_L_mm / eye_origin_R_mm) to stderr, throttled to
-                        --print-eye-origin-rate Hz. Useful for verifying the struct extraction is correct.
-  --print-eye-origin-rate PRINT_EYE_ORIGIN_RATE
-                        Max prints per second for --print-eye-origin (default: 5)
-  --calib-file CALIB_FILE
-                        Path to calibration points JSON file (default: /home/pi/work/github/tobiifree/applications/python-
-                        mouse/calib_points.json)
-  --radius RADIUS       Initial calibration correction radius in pixels (default: 300, or whatever is stored in the calib file)
-  --head-gain HEAD_GAIN
-                        Gain applied to frame-to-frame eye-origin (head) movement when head-movement correction is toggled on via
-                        SIGUSR3 (SIGRTMIN); the resulting scaled delta is accumulated into the mouse x/y position each frame. Units
-                        depend on tobiifreed's eye-origin coordinate system (often mm) — tune to taste (default: 15.0)
-```
-
-The mouse activities can be paused/unpaused using a system-wide hotkey (defined in the Linux Desktop keyboard settings) which sends signals to the running task (SIGUSR1 pause/resume, SIGUSR2 toggle calibration, SIGUSR3 (SIGRTMIN) toggle head-movement correction).
-On raspian (using labwc), add the hotkeys to  ~/.config/labwc/rc.xml, e.g.
-```
-<keyboard>
-  <keybind key="A-m">
-    <action name="Execute">
-      <command>pkill -USR1 -f gaze_mouse.py</command>
-    </action>
-  </keybind>
-  <keybind key="A-c">
-    <action name="Execute">
-      <command>pkill -USR2 -f gaze_mouse.py</command>
-    </action>
-  </keybind>
-  <keybind key="A-h">
-    <action name="Execute">
-      <command>pkill -SIGRTMIN -f gaze_mouse.py</command>
-    </action>
-  </keybind>
-</keyboard>
-```
-
-
+The mouse activities can be controlled during operation by using a pipe (FIFO) which accepts commands like `toggle mouse emulation`, `start calibration`, `toggle head assist`. The provided `gaze_ctl` tool can be used to send these commands into the FIFO of the gaze_mouse application. The tool call can be bound to system-wide hotkeys easily (via the Linux Desktop keyboard settings).
 
 ## Firmware extraction
 
-I tried to extract the firmware from the .exe files provided with the Tobii driver (i suspected *Tobii.Service.exe* to be the correct file) but no .data section ws found.
+The Tobii firmware can be extracted from the .exe files provided with the Tobii driver (i suspected *Tobii.Service.exe* to be the correct file) but no .data section was found.
 I tried different exe files from other installers, and this file worked:
 
 ```
@@ -159,10 +70,7 @@ found 2 CAI container(s)
   [1] off=0x12b3c28 size=45665 version=t2srv:02a1a6a977 -> fw_extracted//cai_1_t2srv_02a1a6a977.bin
 ```
 
-Still, i am unsure if this is correct anecho uinput | sudo tee /etc/modules-load.d/uinput.conf
-d the flash tool would work, as i don't want to brick the only ET-5 I have here ;)
-does this look correct? - and: how can a ET-5 in runtime mode be put into bootloader mode for accepting new firmware?
-
+Still, i am unsure if this is correct and the flash tool would work ...
 
 ## Building / Running on RaspberryPi
 
@@ -184,7 +92,6 @@ sudo udevadm control --reload && sudo udevadm trigger
 ```
 * run ```npm install``` in the repository root folder to install vite for the web demo.
 
-
 ### Mouse emulation
 
 because of the restrictions Wayland imposes to system-wide mouse cursor control, uinput was used, which needs its own udev rule:
@@ -201,9 +108,30 @@ In case of access problems to uinput (for mouse emulation) make sure the module 
 echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 ```
 
+### Keyboard / Hotkey binding
 
-## Other remarks and findings 
+On raspian (using labwc), add keyboard hotkeys to  ~/.config/labwc/rc.xml, e.g.
+```
+<keyboard>
+  <keybind key="A-m">
+    <action name="Execute">
+      <command>/home/pi/tobii/applications/python-mouse/gaze-ctl toggle_pause</command>
+    </action>
+  </keybind>
+  <keybind key="A-c">
+    <action name="Execute">
+      <command>/home/pi/tobii/applications/python-mouse/gaze-ctl calibrate</command>
+    </action>
+  </keybind>
+  <keybind key="A-h">
+    <action name="Execute">
+      <command>/home/pi/tobii/applications/python-mouse/gaze-ctl toggle_head_assist</command>
+    </action>
+  </keybind>
+</keyboard>
+```
 
+## Troubleshooting 
 
 ### USB access problems in Chrome
 USB access for the Web demo did not work in Chrome (Laptop running Ubuntu, althouth udev rules were correctly installed), unless I enabled the web browser access rights via snap:
@@ -212,30 +140,19 @@ USB access for the Web demo did not work in Chrome (Laptop running Ubuntu, altho
 ```
 sudo snap connect chromium:raw-usb
 ```
+
+### Camera access problems in Chrome under Android
+The Web SDK can work under Android, given that your device supports, USB-OTG. You can attach the tracker via an USB-C/USB-A OTG adapter. Make sure to use Chrome, and to grand camera/mic access in the Android settings (else, the connection can not be established and you will see an unrelated error when trying to connect).
  
 ### tobiifree-overlay screen mapping issue
-In my first try I got completely wrong mappings for the gaze point overlay.
-I noted following warning messages when running "just overlay":
+Wrong mappings for the gaze point overlay can have different reasons, such as GTK4 layer shell not being available:
 
 ```
+just overlay
 it appears your Wayland compositor does not support the Session Lock protocol
 ** (tobiifree-overlay:15852): WARNING **: 21:08:00.664: Failed to initialize layer surface, it appears your Wayland compositor doesn't support Layer Shell
 ```
 
-It seems that the gtk4-layer-shell Wayland extension fails to initialize on my laptop (Ubuntu with Gnome/Mutter).
-
-I added log messages to main.zig and found that the gaze x/y coordinates looked good (normalized to 0..1 for the x/y gaze location when looking around at the screen),
-but the mapped screen coordinates where completely wrong, e.g:
-
-```
-Info(overlay): gaze norm: x=0.200 y=0.358 | screen px: x=307 y=344 | screen=1536x960 (sample #709)
-```
-
-I noticed that the screen size was detected as 1536 x 960 - which is wrong, as I used a resolution of 1920 x 1200 (with a 1.25 scale factor).
-The error was bigger than just the scale factor.. It turned out that because the GTK Layer Shell failed, the overlay window silently falls back to a standard floating window with a much smaller size! 
-
-Following a suggestion by Gemini 3.1, I forced the fallback standard window into Fullscreen (and later into an undocked, floating window with fullscreen size because GTK refused to render fullscreen windows with transparent background).
-Thus, I got a working gazepoint overlay which matches my actual gaze position quite well!
-
- 
- 
+Gtk4-layer-shell Wayland extension fail to initialize e.g. on Ubuntu with Gnome/Mutter.
+Then, the overlay window silently falls back to a standard floating window with a much smaller size! 
+Forcing the fallback standard window into Fullscreen (or into an undocked, floating window with fullscreen size because GTK refused to render fullscreen windows with transparent background) can be a good work-around for correct gazepoint position!
